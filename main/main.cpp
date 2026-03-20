@@ -240,6 +240,8 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
 [[maybe_unused]] static uint8_t ble_tx_placeholder = 0;
 #endif // ENABLE_BLE
 
+int64_t rtc_now_ms();
+
 static void debug_log_line(const std::string& msg);
 //exported symbol (linkable from other .cpp)
 void debug_log_line_public(const std::string& msg) {
@@ -341,10 +343,34 @@ static bool ends_with_adi(const char* name) {
   return (n >= 4) && (strcasecmp(name + (n - 4), ".adi") == 0);
 }
 
+static bool is_rxtx_log_name(const char* name) {
+  if (!name) return false;
+  // Match RT[YYMMDD].log -> total length 12
+  // Example: RT260319.log
+  if (strlen(name) != 12) return false;
+  if (name[0] != 'R' || name[1] != 'T') return false;
+  for (int i = 2; i < 8; ++i) {
+    if (name[i] < '0' || name[i] > '9') return false;
+  }
+  return strcmp(name + 8, ".log") == 0;
+}
+
+static void build_rxtx_log_path(char* path, size_t path_sz) {
+  time_t now = (time_t)(rtc_now_ms() / 1000);
+  struct tm t;
+  localtime_r(&now, &t);
+
+  // RT[YYMMDD].log
+  snprintf(path, path_sz, "/spiffs/RT%02d%02d%02d.log",
+           (t.tm_year + 1900) % 100,
+           (t.tm_mon + 1) % 100,
+           t.tm_mday % 100);
+}
+
 static bool is_log_file_on_spiffs(const char* name) {
   if (!name) return false;
   if (ends_with_adi(name)) return true;
-  return (strcmp(name, "RxTxLog.txt") == 0) ||
+  return is_rxtx_log_name(name) ||
          (strcmp(name, "Station.ini") == 0) ||
          (strcmp(name, "fieldday.log") == 0);
 }
@@ -384,7 +410,7 @@ static esp_err_t copy_file_overwrite(const char* src_path, const char* dst_path)
 }
 
 // Copy all log files from SPIFFS -> SD card, overwriting destination.
-// Copies: *.adi, RxTxLog.txt, StationData.ini
+// Copies: *.adi, RT[YYMMDD].log, Station.ini
 static esp_err_t copy_logs_spiffs_to_sd_overwrite() {
   esp_err_t mret = ensure_sdcard_mounted();
   if (mret != ESP_OK) return mret;
@@ -420,8 +446,9 @@ static esp_err_t copy_logs_spiffs_to_sd_overwrite() {
   return last_err;
 }
 
-// Delete log files on SPIFFS (keep StationData.ini).
-// Deletes: *.adi and RxTxLog.txt
+// Delete log files on SPIFFS (keep Station.ini).
+// Deletes: *.adi, RT[YYMMDD].log, fieldday.log
+
 static esp_err_t delete_logs_on_spiffs_keep_stationdata() {
   DIR* d = opendir("/spiffs");
   if (!d) return ESP_FAIL;
@@ -431,7 +458,7 @@ static esp_err_t delete_logs_on_spiffs_keep_stationdata() {
     const char* name = ent->d_name;
     if (!name || name[0] == '.') continue;
 
-    if (ends_with_adi(name) || strcmp(name, "RxTxLog.txt") == 0 || strcmp(name, "fieldday.log") == 0) {
+    if (ends_with_adi(name) || is_rxtx_log_name(name) || strcmp(name, "fieldday.log") == 0) {
       std::string path = std::string("/spiffs/") + name;
       unlink(path.c_str());  // ignore missing/err
     }
@@ -723,7 +750,7 @@ static std::vector<std::string> g_ctrl_lines = {
 };
 
 static std::vector<std::string> g_startup_lines = {
-    "Mini-FT8 V1.4.0",
+    "Mini-FT8 V1.4.1",
     "S: Status(Operate)",
     "R: Rx page",
     "T: Tx page",
@@ -815,7 +842,6 @@ static void draw_battery_icon(int x, int y, int w, int h, int level, bool chargi
 static void draw_status_view();
 static void draw_status_line(int idx, const std::string& text, bool highlight);
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
-int64_t rtc_now_ms();
 static void update_countdown();
 static void menu_flash_tick();
 static void rx_flash_tick();
@@ -1019,18 +1045,22 @@ static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& t
            t.tm_hour, t.tm_min, t.tm_sec);
   double freq_mhz = 0.001 * (double)g_bands[g_band_sel].freq;
 
+  char log_path[64];
+  build_rxtx_log_path(log_path, sizeof(log_path));
+
   // Take mutex for file access
   if (xSemaphoreTake(log_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
     ESP_LOGW(TAG, "RxTxLog mutex timeout");
     return;
   }
 
-  FILE* f = fopen("/spiffs/RxTxLog.txt", "a");
+  FILE* f = fopen(log_path, "a");
   if (!f) {
-    ESP_LOGW(TAG, "RxTxLog open failed");
+    ESP_LOGW(TAG, "RxTxLog open failed: %s", log_path);
     xSemaphoreGive(log_mutex);
     return;
   }
+
   // For TX, omit SNR and repeat; for RX keep SNR.
   if (dir == 'T') {
     fprintf(f, "%c [%s][%.3f] %s %d\n",
@@ -1039,6 +1069,7 @@ static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& t
     fprintf(f, "%c [%s][%.3f] %s %d %d\n",
             dir, ts, freq_mhz, text.c_str(), snr, offset_hz);
   }
+
   fclose(f);
   xSemaphoreGive(log_mutex);
 }
