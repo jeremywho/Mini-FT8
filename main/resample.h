@@ -52,6 +52,19 @@ int uac_to_ft8_samples(
     int num_stereo_samples  // Number of stereo sample pairs at 48kHz
 );
 
+// Generic conversion: 48kHz PCM (16/24-bit mono/stereo) -> 12kHz mono float
+// Input: Raw PCM USB audio bytes
+// Output: 12kHz mono float samples ready for FT8 processing
+// Returns: Number of 12kHz samples written
+int uac_pcm_to_ft8_samples(
+    resample_state_t* state,
+    const uint8_t* in,      // USB PCM buffer
+    int in_bytes,           // Number of input bytes
+    float* out,             // Output buffer (12kHz mono float)
+    int bit_resolution,     // 16 or 24
+    int channels            // 1 or 2
+);
+
 #ifdef __cplusplus
 }
 #endif

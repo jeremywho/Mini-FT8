@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-// UAC audio format requirements (strict)
+// Preferred UAC audio format (QMX profile uses this strictly)
 #define UAC_SAMPLE_RATE     48000
 #define UAC_BIT_RESOLUTION  24
 #define UAC_CHANNELS        2
@@ -26,6 +26,12 @@ typedef enum {
     UAC_STATE_ERROR,        // Error state
 } uac_stream_state_t;
 
+// UAC profile controls how USB devices are selected/opened.
+typedef enum {
+    UAC_PROFILE_QMX = 0,         // Prefer known QMX CAT interface hints
+    UAC_PROFILE_GENERIC_USB = 1, // Generic USB audio + generic CDC scan
+} uac_stream_profile_t;
+
 // Get current UAC streaming state
 uac_stream_state_t uac_get_state(void);
 
@@ -36,6 +42,7 @@ bool uac_is_streaming(void);
 // This starts USB host tasks and waits for device connection
 // Returns true on success, false on failure
 bool uac_start(void);
+bool uac_start_with_profile(uac_stream_profile_t profile);
 
 // Stop UAC streaming and cleanup
 // Call when exiting Host mode

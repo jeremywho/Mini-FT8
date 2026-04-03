@@ -49,6 +49,12 @@ int64_t rtc_now_ms();
 // 288 bytes = 48 stereo samples per 1ms USB transfer, 4608 = 288 * 16
 #define UAC_READ_BUFFER_SIZE    4608
 
+typedef struct {
+    uint32_t sample_freq;
+    uint8_t bit_resolution;
+    uint8_t channels;
+} uac_active_format_t;
+
 // Event types for internal queue
 typedef enum {
     UAC_EVT_DRIVER,
@@ -81,6 +87,12 @@ static TaskHandle_t s_uac_task_handle = NULL;
 static TaskHandle_t s_stream_task_handle = NULL;
 static volatile bool s_stop_requested = false;
 static char s_status_string[64] = "Idle";
+static uac_stream_profile_t s_profile = UAC_PROFILE_QMX;
+static uac_active_format_t s_format = {
+    .sample_freq = UAC_SAMPLE_RATE,
+    .bit_resolution = UAC_BIT_RESOLUTION,
+    .channels = UAC_CHANNELS,
+};
 static bool s_cdc_installed = false;
 static int s_cdc_iface = -1;
 static int s_cdc_iface_hint = -1;
@@ -103,6 +115,17 @@ static void cdc_close(void);
 static void cdc_try_open(void);
 static void cdc_event_cb(const cdc_acm_host_dev_event_data_t* event, void* user_ctx);
 static void cdc_new_dev_cb(usb_device_handle_t usb_dev);
+
+static const char* profile_name(uac_stream_profile_t profile) {
+    switch (profile) {
+    case UAC_PROFILE_QMX:
+        return "qmx_uac";
+    case UAC_PROFILE_GENERIC_USB:
+        return "usb_uac_generic";
+    default:
+        return "unknown";
+    }
+}
 
 // Push waterfall row (same as stream_wav.cpp)
 static void push_waterfall_latest(const monitor_t& mon) {
@@ -186,8 +209,8 @@ static void cdc_try_open(void) {
 
     const int max_iface_scan = 12;
 
-    // Try known QMX CAT (VID/PID, iface 0) first
-    {
+    // QMX profile: try known QMX CAT (VID/PID, iface 0) first.
+    if (s_profile == UAC_PROFILE_QMX) {
         cdc_acm_dev_hdl_t handle = NULL;
         esp_err_t err = cdc_acm_host_open(k_qmx_vid, k_qmx_pid, 0, &dev_cfg, &handle);
         if (err == ESP_OK) {
@@ -234,7 +257,8 @@ static void cdc_try_open(void) {
     }
 
     if (!s_cdc_handle) {
-        ESP_LOGD(TAG, "CDC-ACM not found yet (attempt at %" PRId64 " ms)", now_ms);
+        ESP_LOGD(TAG, "CDC-ACM not found yet (profile=%s attempt at %" PRId64 " ms)",
+                 profile_name(s_profile), now_ms);
     }
 }
 
@@ -431,22 +455,49 @@ static void uac_lib_task(void* arg) {
                     // Print device info
                     uac_host_printf_device_param(handle);
 
-                    // Try to start with required format: 24-bit/48kHz/stereo
-                    uac_host_stream_config_t stm_config = {
-                        .channels = UAC_CHANNELS,
-                        .bit_resolution = UAC_BIT_RESOLUTION,
-                        .sample_freq = UAC_SAMPLE_RATE,
-                        .flags = 0
+                    // Start stream format negotiation.
+                    // QMX profile keeps the existing strict format.
+                    // Generic profile tries mono and 16-bit fallbacks.
+                    uac_host_stream_config_t candidates[4];
+                    int candidate_count = 0;
+                    auto add_candidate = [&](uint8_t ch, uint8_t bits) {
+                        candidates[candidate_count].channels = ch;
+                        candidates[candidate_count].bit_resolution = bits;
+                        candidates[candidate_count].sample_freq = UAC_SAMPLE_RATE;
+                        candidates[candidate_count].flags = 0;
+                        candidate_count++;
                     };
+                    if (s_profile == UAC_PROFILE_GENERIC_USB) {
+                        add_candidate(1, 24);
+                        add_candidate(1, 16);
+                        add_candidate(2, 24);
+                        add_candidate(2, 16);
+                    } else {
+                        add_candidate(UAC_CHANNELS, UAC_BIT_RESOLUTION);
+                    }
 
-                    ESP_LOGI(TAG, "Starting stream: %dHz, %d-bit, %dch",
-                             stm_config.sample_freq, stm_config.bit_resolution, stm_config.channels);
+                    bool started = false;
+                    for (int i = 0; i < candidate_count; ++i) {
+                        const uac_host_stream_config_t* cfg = &candidates[i];
+                        ESP_LOGI(TAG, "Starting stream (profile=%s) candidate %d/%d: %dHz, %d-bit, %dch",
+                                 profile_name(s_profile), i + 1, candidate_count,
+                                 cfg->sample_freq, cfg->bit_resolution, cfg->channels);
+                        err = uac_host_device_start(handle, cfg);
+                        if (err == ESP_OK) {
+                            s_format.sample_freq = cfg->sample_freq;
+                            s_format.bit_resolution = cfg->bit_resolution;
+                            s_format.channels = cfg->channels;
+                            started = true;
+                            ESP_LOGI(TAG, "Selected stream format: %dHz, %d-bit, %dch",
+                                     s_format.sample_freq, s_format.bit_resolution, s_format.channels);
+                            break;
+                        }
+                        ESP_LOGW(TAG, "Stream candidate failed: %s", esp_err_to_name(err));
+                    }
 
-                    err = uac_host_device_start(handle, &stm_config);
-                    if (err != ESP_OK) {
-                        ESP_LOGE(TAG, "Failed to start stream: %s", esp_err_to_name(err));
-                        snprintf(s_status_string, sizeof(s_status_string),
-                                 "Format not supported");
+                    if (!started) {
+                        ESP_LOGE(TAG, "Failed to start stream for profile=%s", profile_name(s_profile));
+                        snprintf(s_status_string, sizeof(s_status_string), "Format not supported");
                         uac_host_device_close(handle);
                         continue;
                     }
@@ -455,7 +506,11 @@ static void uac_lib_task(void* arg) {
                     s_state = UAC_STATE_STREAMING;
                     g_streaming = true;
                     snprintf(s_status_string, sizeof(s_status_string),
-                             "Streaming 48k/24/2");
+                             "Streaming %s %luk/%u/%u",
+                             profile_name(s_profile),
+                             (unsigned long)(s_format.sample_freq / 1000),
+                             s_format.bit_resolution,
+                             s_format.channels);
 
                     // Try to open companion CDC-ACM interface (CAT)
                     cdc_try_open();
@@ -522,7 +577,7 @@ static void stream_uac_task(void* arg) {
     // Allocate buffers
     uint8_t* usb_buffer = (uint8_t*)heap_caps_malloc(UAC_READ_BUFFER_SIZE, MALLOC_CAP_DEFAULT);
     float* ft8_buffer = (float*)heap_caps_malloc(sizeof(float) * mon.block_size, MALLOC_CAP_DEFAULT);
-    // Intermediate buffer for 48kHz mono samples (max: 4096 bytes / 6 = 682 stereo samples)
+    // Intermediate 12kHz output buffer from PCM conversion/resampling.
     float* temp_12k = (float*)heap_caps_malloc(sizeof(float) * 1024, MALLOC_CAP_DEFAULT);
     log_heap("UAC_AFTER_FFT_ALLOC");
 
@@ -560,28 +615,41 @@ static void stream_uac_task(void* arg) {
             continue;
         }
 
-        // With 4608-byte buffer (multiple of 288 USB transfer size), reads should be aligned
-        int num_stereo_samples = bytes_read / 6;
-        int remainder = bytes_read % 6;
+        int frame_bytes = (s_format.bit_resolution / 8) * s_format.channels;
+        if (frame_bytes <= 0) {
+            ESP_LOGW(TAG, "Invalid stream format bytes/frame=%d", frame_bytes);
+            continue;
+        }
+        int num_frames = bytes_read / frame_bytes;
+        int remainder = bytes_read % frame_bytes;
 
         // Debug display
-        if (num_stereo_samples > 0) {
-            int32_t val = usb_buffer[0] | (usb_buffer[1] << 8) | (usb_buffer[2] << 16);
-            if (val & 0x800000) val |= 0xFF000000;
-            bool l_eq_r = (usb_buffer[0] == usb_buffer[3]) &&
-                          (usb_buffer[1] == usb_buffer[4]) &&
-                          (usb_buffer[2] == usb_buffer[5]);
+        if (num_frames > 0) {
+            int32_t val = 0;
+            if (s_format.bit_resolution == 24) {
+                val = usb_buffer[0] | (usb_buffer[1] << 8) | (usb_buffer[2] << 16);
+                if (val & 0x800000) val |= 0xFF000000;
+            } else { // 16-bit
+                int16_t v16 = (int16_t)(usb_buffer[0] | (usb_buffer[1] << 8));
+                val = v16;
+            }
             snprintf(s_debug_line1, sizeof(s_debug_line1),
-                     "v=%ld %s", (long)val, l_eq_r ? "L=R" : "L!=R");
+                     "fmt=%lu/%u/%u v=%ld",
+                     (unsigned long)s_format.sample_freq,
+                     s_format.bit_resolution,
+                     s_format.channels,
+                     (long)val);
             snprintf(s_debug_line2, sizeof(s_debug_line2),
-                     "rd=%lu %%6=%d", (unsigned long)bytes_read, remainder);
+                     "rd=%lu fb=%d rem=%d", (unsigned long)bytes_read, frame_bytes, remainder);
         }
 
-        if (num_stereo_samples == 0) continue;
+        if (num_frames == 0) continue;
 
-        // Convert and resample: 24-bit/48kHz/stereo -> 12kHz mono float
-        int samples_12k = uac_to_ft8_samples(&s_resample_state, usb_buffer,
-                                              temp_12k, num_stereo_samples);
+        // Convert and resample selected USB PCM format -> 12kHz mono float.
+        int samples_12k = uac_pcm_to_ft8_samples(&s_resample_state, usb_buffer,
+                                                 (int)bytes_read, temp_12k,
+                                                 s_format.bit_resolution,
+                                                 s_format.channels);
 
         // Accumulate into ft8_buffer
         for (int i = 0; i < samples_12k && !s_stop_requested; i++) {
@@ -673,17 +741,21 @@ bool uac_is_streaming(void) {
     return s_state == UAC_STATE_STREAMING && s_mic_handle != NULL;
 }
 
-bool uac_start(void) {
+bool uac_start_with_profile(uac_stream_profile_t profile) {
     if (s_state != UAC_STATE_IDLE) {
         ESP_LOGW(TAG, "UAC already started");
         return false;
     }
 
+    s_profile = profile;
     s_cdc_last_attempt_ms = 0;
     s_cdc_iface = -1;
     s_cdc_iface_hint = -1;
+    s_format.sample_freq = UAC_SAMPLE_RATE;
+    s_format.bit_resolution = UAC_BIT_RESOLUTION;
+    s_format.channels = UAC_CHANNELS;
 
-    ESP_LOGI(TAG, "Starting UAC host");
+    ESP_LOGI(TAG, "Starting UAC host profile=%s", profile_name(s_profile));
     s_stop_requested = false;
     resample_init(&s_resample_state);
 
@@ -722,8 +794,12 @@ bool uac_start(void) {
     }
 
     s_state = UAC_STATE_WAITING;
-    snprintf(s_status_string, sizeof(s_status_string), "Waiting for device");
+    snprintf(s_status_string, sizeof(s_status_string), "Waiting for %s", profile_name(s_profile));
     return true;
+}
+
+bool uac_start(void) {
+    return uac_start_with_profile(UAC_PROFILE_QMX);
 }
 
 void uac_stop(void) {

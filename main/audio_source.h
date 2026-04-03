@@ -1,0 +1,28 @@
+#pragma once
+
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+    AUDIO_SOURCE_QMX_UAC = 0,
+    AUDIO_SOURCE_USB_UAC_GENERIC = 1,
+} audio_source_backend_t;
+
+void audio_source_set_backend(audio_source_backend_t backend);
+audio_source_backend_t audio_source_get_backend(void);
+const char* audio_source_backend_name(audio_source_backend_t backend);
+
+bool audio_source_start(void);
+void audio_source_stop(void);
+
+bool audio_source_is_streaming(void);
+const char* audio_source_get_status_string(void);
+const char* audio_source_get_debug_line1(void);
+const char* audio_source_get_debug_line2(void);
+
+#ifdef __cplusplus
+}
+#endif

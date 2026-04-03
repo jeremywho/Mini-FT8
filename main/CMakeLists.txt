@@ -1,6 +1,10 @@
 idf_component_register(
     SRCS "main.cpp"
          "autoseq.cpp"
+         "audio_source.cpp"
+         "radio_control.cpp"
+         "radio_control_qmx.cpp"
+         "radio_control_kh1_cat.cpp"
          "stream_uac.cpp"
          "resample.cpp"
     INCLUDE_DIRS "."

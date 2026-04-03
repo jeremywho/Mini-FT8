@@ -47,7 +47,8 @@ extern "C" {
 #include <sys/time.h>
 #include "esp_timer.h"
 #include "esp_sleep.h"
-#include "stream_uac.h"
+#include "audio_source.h"
+#include "radio_control.h"
 
 #include "driver/spi_master.h"
 #include "driver/sdspi_host.h"
@@ -632,25 +633,25 @@ bool hashtable_lookup(ftx_callsign_hash_type_t hash_type, uint32_t hash, char* c
                                                    ((hash >> 12) & 0x03FFu);
 
     int idx = (hash10 * 23) % CALLSIGN_HASHTABLE_SIZE;
-    int start_idx = idx;
-
-    // Linear probing: must match add()
-    while (callsign_hashtable[idx].callsign[0] != '\0')
+    // Important: entries can be deleted by hashtable_trim_size(), which creates
+    // empty holes in probe chains. Stopping at the first empty slot can miss
+    // valid entries that were inserted later in that chain. Scan the full table.
+    for (int probe = 0; probe < CALLSIGN_HASHTABLE_SIZE; ++probe)
     {
-        uint32_t existing_hash = callsign_hashtable[idx].hash & 0x003FFFFFu;
+        int scan_idx = (idx + probe) % CALLSIGN_HASHTABLE_SIZE;
+        if (callsign_hashtable[scan_idx].callsign[0] == '\0')
+            continue;
+
+        uint32_t existing_hash = callsign_hashtable[scan_idx].hash & 0x003FFFFFu;
 
         if ((existing_hash >> hash_shift) == hash)
         {
-            strcpy(callsign, callsign_hashtable[idx].callsign);
+            strcpy(callsign, callsign_hashtable[scan_idx].callsign);
 
-            // Reset age to 0 on successful hit, preserve 22-bit payload
-            callsign_hashtable[idx].hash = existing_hash;
+            // Reset age to 0 on successful hit, preserve 22-bit payload.
+            callsign_hashtable[scan_idx].hash = existing_hash;
             return true;
         }
-
-        idx = (idx + 1) % CALLSIGN_HASHTABLE_SIZE;
-        if (idx == start_idx)
-            break;
     }
 
     callsign[0] = '\0';
@@ -795,7 +796,7 @@ static std::vector<std::string> g_ctrl_lines = {
 };
 
 static std::vector<std::string> g_startup_lines = {
-    "Mini-FT8 V1.4.1",
+    "Mini-FT8 V1.4.2",
     "S: Status(Operate)",
     "R: Rx page",
     "T: Tx page",
@@ -842,7 +843,11 @@ static int g_rtc_comp = 0;
 
 enum class CqType { CQ, CQSOTA, CQPOTA, CQQRP, CQFD, CQFREETEXT };
 enum class OffsetSrc { RANDOM, CURSOR, RX };
-enum class RadioType { NONE, TRUSDX, QMX };
+enum class RadioType { NONE, TRUSDX, QMX, KH1 };
+struct RadioProfileBinding {
+  audio_source_backend_t audio_backend;
+  radio_control_backend_t radio_backend;
+};
 static CqType g_cq_type = CqType::CQ;
 static std::string g_cq_freetext = "FreeText";
 static bool g_skip_tx1 = false;
@@ -855,6 +860,9 @@ static RadioType g_radio = RadioType::QMX;
 static std::string g_ant = "EFHW";
 static std::string g_comment1 = "MiniFT8 /Radio /Ant";
 static bool g_rxtx_log = true;
+static RadioType canonical_radio_type(RadioType r);
+static RadioProfileBinding get_radio_profile_binding(RadioType r);
+static void apply_radio_profile_binding();
 // Single-threaded TX state machine (replaces separate tx_send_task)
 // TX runs in main loop via tx_tick(), one tone at a time
 static bool g_tx_active = false;           // TX state machine is running
@@ -1246,11 +1254,7 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
   };
   // Expand placeholders using current radio/ant strings
   auto radio_name_local = [](RadioType r) {
-    switch (r) {
-      case RadioType::TRUSDX: return "QMX";
-      case RadioType::QMX: return "QMX";
-      default: return "None";
-    }
+    return (r == RadioType::KH1) ? "KH1" : "QMX";
   };
   repl(comment_expanded, "/Radio", radio_name_local(g_radio));
   repl(comment_expanded, "/Ant", g_ant);
@@ -1525,13 +1529,44 @@ static const char* offset_name(OffsetSrc o) {
   return "Random";
 }
 
+static RadioType canonical_radio_type(RadioType r) {
+  return (r == RadioType::KH1) ? RadioType::KH1 : RadioType::QMX;
+}
+
+static RadioProfileBinding get_radio_profile_binding(RadioType r) {
+  switch (canonical_radio_type(r)) {
+    case RadioType::KH1:
+      return {AUDIO_SOURCE_USB_UAC_GENERIC, RADIO_CONTROL_KH1_CAT};
+    case RadioType::QMX:
+    default:
+      return {AUDIO_SOURCE_QMX_UAC, RADIO_CONTROL_QMX};
+  }
+}
+
 static const char* radio_name(RadioType r) {
-  switch (r) {
-    case RadioType::NONE: return "QMX";
-    case RadioType::TRUSDX: return "QMX";
+  switch (canonical_radio_type(r)) {
     case RadioType::QMX: return "QMX";
+    case RadioType::KH1: return "KH1";
+    default: break;
   }
   return "None";
+}
+
+static void apply_radio_profile_binding() {
+  audio_source_backend_t prev_audio = audio_source_get_backend();
+  g_radio = canonical_radio_type(g_radio);
+  RadioProfileBinding binding = get_radio_profile_binding(g_radio);
+  audio_source_set_backend(binding.audio_backend);
+  radio_control_set_backend(binding.radio_backend);
+  if (audio_source_is_streaming() && prev_audio != binding.audio_backend) {
+    ESP_LOGW(TAG, "Audio backend changed while streaming; restart HOST mode to apply (%s -> %s)",
+             audio_source_backend_name(prev_audio),
+             audio_source_backend_name(binding.audio_backend));
+  }
+  ESP_LOGI(TAG, "Profile bind radio=%s audio=%s control=%s",
+           radio_name(g_radio),
+           audio_source_backend_name(binding.audio_backend),
+           radio_control_backend_name(binding.radio_backend));
 }
 
 static std::string expand_comment1() {
@@ -2421,11 +2456,10 @@ static void tx_send_ta(float tone_hz) {
   float frac = tone_hz - (float)ta_int;
   int ta_frac = (int)lrintf(frac * 100.0f);
   if (ta_int == g_tx_last_ta_int && ta_frac == g_tx_last_ta_frac) return;
-  char ta[16];
-  snprintf(ta, sizeof(ta), "TA%04d.%02d;", ta_int, ta_frac);
-  cat_cdc_send(reinterpret_cast<const uint8_t*>(ta), strlen(ta), 10);
-  g_tx_last_ta_int = ta_int;
-  g_tx_last_ta_frac = ta_frac;
+  if (radio_control_set_tone_hz(tone_hz) == ESP_OK) {
+    g_tx_last_ta_int = ta_int;
+    g_tx_last_ta_frac = ta_frac;
+  }
 }
 
 // Start TX (single-threaded state machine initialization)
@@ -2475,12 +2509,14 @@ static void tx_start(int skip_tones) {
   ESP_LOGI(TAG, "TX base_hz=%d (from pre-computed offset, text=%s)", g_tx_base_hz, g_pending_tx.text.c_str());
 
   // Send CAT setup commands
-  g_tx_cat_ok = cat_cdc_ready();
+  g_tx_cat_ok = radio_control_ready();
   if (g_tx_cat_ok) {
-    const char* md = "MD6;";
-    const char* tx = "TX;";
-    cat_cdc_send(reinterpret_cast<const uint8_t*>(md), strlen(md), 200);
-    cat_cdc_send(reinterpret_cast<const uint8_t*>(tx), strlen(tx), 200);
+    int freq_hz = g_bands[g_band_sel].freq * 1000;
+    esp_err_t err = radio_control_begin_tx(freq_hz, g_tx_base_hz);
+    if (err != ESP_OK) {
+      ESP_LOGW(TAG, "tx_start: radio TX begin failed: %s", esp_err_to_name(err));
+      g_tx_cat_ok = false;
+    }
   }
 
   // Auto-switch to TX screen when transmission starts
@@ -2513,8 +2549,7 @@ static void tx_tick() {
   if (g_tx_cancel_requested) {
     ESP_LOGI(TAG, "tx_tick: TX cancelled at tone %d", g_tx_tone_idx);
     if (g_tx_cat_ok) {
-      const char* rx = "RX;";
-      cat_cdc_send(reinterpret_cast<const uint8_t*>(rx), strlen(rx), 200);
+      radio_control_end_tx();
     }
     g_tx_active = false;
     g_pending_tx_valid = false;
@@ -2533,8 +2568,7 @@ static void tx_tick() {
   if (g_tx_tone_idx >= 79) {
     ESP_LOGI(TAG, "tx_tick: TX complete, all 79 tones sent");
     if (g_tx_cat_ok) {
-      const char* rx = "RX;";
-      cat_cdc_send(reinterpret_cast<const uint8_t*>(rx), strlen(rx), 200);
+      radio_control_end_tx();
     }
     // Record slot index for spacing and notify autoseq
     s_last_tx_slot_idx = g_tx_slot_idx;
@@ -2639,7 +2673,7 @@ static void draw_status_view() {
   std::string lines[6];
   BeaconMode disp_beacon = (ui_mode == UIMode::STATUS) ? g_status_beacon_temp : g_beacon;
   lines[0] = std::string("Beacon: ") + beacon_name(disp_beacon);
-  if (uac_is_streaming()) {
+  if (audio_source_is_streaming()) {
     lines[1] = std::string("Sync to ") + radio_name(g_radio);
   } else {
     lines[1] = std::string("Connect to ") + radio_name(g_radio);
@@ -3160,7 +3194,8 @@ static void load_station_data() {
     } else if (sscanf(line, "offset_src=%d", &val) == 1) {
       if (val >= 0 && val <= 2) g_offset_src = (OffsetSrc)val;
     } else if (sscanf(line, "radio=%d", &val) == 1) {
-      if (val >= 0 && val <= 2) g_radio = (RadioType)val;
+      if (val == (int)RadioType::KH1) g_radio = RadioType::KH1;
+      else g_radio = RadioType::QMX;
     } else if (strncmp(line, "cq_ft=", 6) == 0) {
       g_cq_freetext = trim_copy(line + 6);
     } else if (strncmp(line, "free_text=", 10) == 0) {
@@ -3221,7 +3256,7 @@ static void save_station_data() {
   fprintf(f, "call=%s\n", g_call.c_str());
   fprintf(f, "grid=%s\n", g_grid.c_str());
   fprintf(f, "offset_src=%d\n", (int)g_offset_src);
-  fprintf(f, "radio=%d\n", (int)g_radio);
+  fprintf(f, "radio=%d\n", (int)canonical_radio_type(g_radio));
   fprintf(f, "ant=%s\n", g_ant.c_str());
   fprintf(f, "comment1=%s\n", g_comment1.c_str());
   fprintf(f, "rxtx_log=%d\n", g_rxtx_log ? 1 : 0);
@@ -3301,10 +3336,12 @@ static void enter_mode(UIMode new_mode) {
     // Start UAC audio streaming
     g_uac_lines.clear();
     g_uac_lines.push_back("USB Audio Host Mode");
-    if (uac_start()) {
+    apply_radio_profile_binding();
+    if (audio_source_start()) {
       g_decode_enabled = true;
       ui_set_paused(false);
       ui_clear_waterfall();
+      radio_control_on_audio_start();
       g_uac_lines.push_back("Starting USB host...");
       g_uac_lines.push_back("Connect 24-bit/48kHz");
       g_uac_lines.push_back("stereo USB mic");
@@ -3361,6 +3398,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
   ui_mode = UIMode::RX;
   load_station_data();
+  apply_radio_profile_binding();
   update_autoseq_cq_type();
 
   // Update autoseq with station info after loading
@@ -3455,12 +3493,12 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       if (g_uac_lines.size() > 1) {
         g_uac_lines.resize(1);
       }
-      g_uac_lines.push_back(uac_get_status_string());
-      if (uac_is_streaming()) {
+      g_uac_lines.push_back(audio_source_get_status_string());
+      if (audio_source_is_streaming()) {
         g_uac_lines.push_back("Decoding FT8...");
         // Show debug lines with raw USB sample data
-        const char* dbg1 = uac_get_debug_line1();
-        const char* dbg2 = uac_get_debug_line2();
+        const char* dbg1 = audio_source_get_debug_line1();
+        const char* dbg2 = audio_source_get_debug_line2();
         if (dbg1[0]) g_uac_lines.push_back(dbg1);
         if (dbg2[0]) g_uac_lines.push_back(dbg2);
       }
@@ -3513,9 +3551,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         (ui_mode == UIMode::RX || ui_mode == UIMode::TX || ui_mode == UIMode::STATUS) &&
         status_edit_idx == -1) {
       g_tx_cancel_requested = true;
-      if (cat_cdc_ready()) {
-        const char* rx = "RX;";
-        cat_cdc_send(reinterpret_cast<const uint8_t*>(rx), strlen(rx), 50);
+      if (radio_control_ready()) {
+        radio_control_end_tx();
       }
       debug_log_line("TX cancel requested");
       last_key = c;
@@ -3593,7 +3630,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   }
 
   static int last_status_uac = -1; // -1 forces a redraw on first entry
-  int cur_uac = uac_is_streaming() ? 1 : 0;
+  int cur_uac = audio_source_is_streaming() ? 1 : 0;
   if (ui_mode == UIMode::STATUS && cur_uac != last_status_uac) {
     draw_status_view();
   }
@@ -3604,7 +3641,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   }
 
   // Ensure decode is enabled whenever streaming becomes active.
-  if (uac_is_streaming() && !g_decode_enabled) {
+  if (audio_source_is_streaming() && !g_decode_enabled) {
     g_decode_enabled = true;
     ui_set_paused(false);
   }
@@ -3764,27 +3801,20 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           else if (c == '2') {
             status_edit_idx = 1;
             draw_status_view();
-            if (!uac_is_streaming()) {
+            if (!audio_source_is_streaming()) {
               debug_log_line("Starting UAC host...");
-              if (!uac_start()) {
+              apply_radio_profile_binding();
+              if (!audio_source_start()) {
                 debug_log_line("UAC start failed");
               } else {
                 g_decode_enabled = true;
                 ui_set_paused(false);
                 ui_clear_waterfall();
+                radio_control_on_audio_start();
               }
             } else {
               int freq_hz = g_bands[g_band_sel].freq * 1000;
-              char cmd[32];
-              snprintf(cmd, sizeof(cmd), "FA%011d;", freq_hz);
-              bool ok = false;
-              if (cat_cdc_ready()) {
-                if (cat_cdc_send(reinterpret_cast<const uint8_t*>(cmd), strlen(cmd), 200) == ESP_OK) {
-                  ok = true;
-                }
-                const char* md = "MD6;";
-                cat_cdc_send(reinterpret_cast<const uint8_t*>(md), strlen(md), 200);
-              }
+              bool ok = (radio_control_sync_frequency_mode(freq_hz) == ESP_OK);
               debug_log_line(ok ? "CAT sync sent" : "CAT not ready");
             }
             status_edit_idx = -1;
@@ -3798,27 +3828,14 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             }
               else if (c == '4') {
                 g_tune = !g_tune;
-                if (cat_cdc_ready()) {
+                if (radio_control_ready()) {
                   int freq_hz = g_bands[g_band_sel].freq * 1000;
-                  char cmd[32];
-                  snprintf(cmd, sizeof(cmd), "FA%011d;", freq_hz);
-                  cat_cdc_send(reinterpret_cast<const uint8_t*>(cmd), strlen(cmd), 200); // set VFO
-                  cat_cdc_send(reinterpret_cast<const uint8_t*>(cmd), strlen(cmd), 200); // confirm VFO
-                  const char* md = "MD6;";
-                  cat_cdc_send(reinterpret_cast<const uint8_t*>(md), strlen(md), 200);   // USB mode
-                  if (g_tune) {
-                const char* tx = "TX;";
-                cat_cdc_send(reinterpret_cast<const uint8_t*>(tx), strlen(tx), 200); // key down
-                // Use current cursor/random offset ~1500 Hz as tune tone
-                int tune_hz = (g_offset_src == OffsetSrc::CURSOR) ? g_offset_hz : 1500;
-                char ta[16];
-                snprintf(ta, sizeof(ta), "TA%04d.%02d;", tune_hz, 0);
-                cat_cdc_send(reinterpret_cast<const uint8_t*>(ta), strlen(ta), 200); // start tune carrier
-                debug_log_line("CAT tune: TX TA");
+                  int tune_hz = (g_offset_src == OffsetSrc::CURSOR) ? g_offset_hz : 1500;
+                  if (radio_control_set_tune(g_tune, freq_hz, tune_hz) == ESP_OK) {
+                    debug_log_line(g_tune ? "CAT tune: TX" : "CAT tune: RX");
                   } else {
-                    const char* rx = "RX;";
-                    cat_cdc_send(reinterpret_cast<const uint8_t*>(rx), strlen(rx), 200); // release
-                    debug_log_line("CAT tune: RX");
+                    ESP_LOGW(TAG, "CAT tune command failed");
+                    debug_log_line("CAT tune failed");
                   }
                 } else {
                   ESP_LOGW(TAG, "CAT not ready; tune skipped");
@@ -4081,7 +4098,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   menu_edit_buf = std::to_string(g_offset_hz);
                   draw_menu_view();
                 } else if (c == '3') {
-                  g_radio = (RadioType)(((int)g_radio + 1) % 3);
+                  g_radio = (canonical_radio_type(g_radio) == RadioType::KH1)
+                              ? RadioType::QMX
+                              : RadioType::KH1;
+                  apply_radio_profile_binding();
                   save_station_data();
                   draw_menu_view();
                 } else if (c == '4') {
@@ -4184,7 +4204,3 @@ static void draw_status_line(int idx, const std::string& text, bool highlight) {
   }
   M5.Display.endWrite();
 }
-
-
-
-
