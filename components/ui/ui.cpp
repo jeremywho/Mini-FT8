@@ -19,7 +19,12 @@ static bool waterfall_dirty = false;
 static std::vector<UiRxLine> rx_lines;
 static int rx_page = 0;
 static int rx_selected = -1;  // global index into rx_lines
-static std::vector<UiRxLine> last_drawn_lines;
+struct RxDrawCacheEntry {
+    std::string text;
+    bool is_cq = false;
+    bool is_to_me = false;
+};
+static std::vector<RxDrawCacheEntry> last_drawn_cache;
 static int last_page = -1;
 static std::string g_visible_rows[RX_LINES];
 
@@ -206,12 +211,12 @@ void ui_set_rx_list(const std::vector<UiRxLine>& lines) {
     rx_lines = lines;
     rx_page = 0;       // reset to first page
     rx_selected = -1;  // clear selection
-    last_drawn_lines.clear();
+    last_drawn_cache.clear();
     last_page = -1;
 }
 
 void ui_force_redraw_rx() {
-    last_drawn_lines.clear();
+    last_drawn_cache.clear();
     last_page = -1;
 }
 
@@ -244,12 +249,12 @@ void ui_draw_rx(int flash_index) {
     const int start_y = WATERFALL_H + COUNTDOWN_H + 3;
     // Only redraw when page changes or content changes, but always draw if list is empty
     if (!(rx_lines.empty()) && flash_index < 0) {
-        if (rx_page == last_page && last_drawn_lines.size() == rx_lines.size()) {
+        if (rx_page == last_page && last_drawn_cache.size() == rx_lines.size()) {
             bool same = true;
             for (size_t i = 0; i < rx_lines.size(); ++i) {
-                if (rx_lines[i].text != last_drawn_lines[i].text ||
-                    rx_lines[i].is_cq != last_drawn_lines[i].is_cq ||
-                    rx_lines[i].is_to_me != last_drawn_lines[i].is_to_me) {
+                if (rx_lines[i].text != last_drawn_cache[i].text ||
+                    rx_lines[i].is_cq != last_drawn_cache[i].is_cq ||
+                    rx_lines[i].is_to_me != last_drawn_cache[i].is_to_me) {
                     same = false;
                     break;
                 }
@@ -279,10 +284,15 @@ void ui_draw_rx(int flash_index) {
     // cache drawn content
     if (flash_index < 0) {
         last_page = rx_page;
-        last_drawn_lines = rx_lines;
+        last_drawn_cache.resize(rx_lines.size());
+        for (size_t i = 0; i < rx_lines.size(); ++i) {
+            last_drawn_cache[i].text = rx_lines[i].text;
+            last_drawn_cache[i].is_cq = rx_lines[i].is_cq;
+            last_drawn_cache[i].is_to_me = rx_lines[i].is_to_me;
+        }
     } else {
         last_page = -1;
-        last_drawn_lines.clear();
+        last_drawn_cache.clear();
     }
 }
 

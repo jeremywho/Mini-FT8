@@ -29,6 +29,8 @@ extern void log_heap(const char* tag);
 // External references from main.cpp
 extern bool g_streaming;
 extern bool g_decode_enabled;
+extern int g_time_osr;
+extern int g_freq_osr;
 extern int64_t g_decode_slot_idx;
 extern volatile bool g_decode_in_progress;
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
@@ -565,8 +567,8 @@ static void stream_uac_task(void* arg) {
         .f_min = 200.0f,
         .f_max = 3000.0f,
         .sample_rate = FT8_SAMPLE_RATE,
-        .time_osr = 1,
-        .freq_osr = 1,
+        .time_osr = g_time_osr,
+        .freq_osr = g_freq_osr,
         .protocol = FTX_PROTOCOL_FT8
     };
 

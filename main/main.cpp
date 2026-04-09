@@ -58,6 +58,7 @@ extern "C" {
 static const char* STATION_FILE = "/spiffs/Station.ini";
 static sdmmc_card_t* g_sd_card = NULL;
 static bool g_sd_mounted = false;
+static bool g_ble_enabled = true;
 
 #define ENABLE_BLE 1
 
@@ -298,6 +299,11 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             g_conn_handle = event->connect.conn_handle;
+            if (!g_ble_enabled) {
+              ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+              g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+              return 0;
+            }
             g_ble_force_send = true;
             g_ble_last_tick_slot = -1;
             g_ble_last_tick_sec = -1;
@@ -790,7 +796,7 @@ static bool rewrite_dxpedition_for_mycall(const std::string& raw_text,
 }
 
 static const char* TAG = "FT8";
-enum class UIMode { RX, TX, BAND, MENU, HOST, CONTROL, DEBUG, LIST, STATUS, QSO };
+enum class UIMode { RX, TX, BAND, MENU, CONTROL, DEBUG, STATUS, QSO };
 static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
 static std::vector<UiRxLine> g_rx_lines;
@@ -837,6 +843,14 @@ static int status_cursor_pos = -1;
 static std::vector<std::string> g_debug_lines;
 static int debug_page = 0;
 static const size_t DEBUG_MAX_LINES = 18; // 3 pages
+static const size_t DEBUG_HUD_LINES = 2;  // slots 0-1 reserved for live HUD
+static constexpr uint32_t APP_CORE0_STACK_BYTES = 12288; // Tune to 16384/18432 if Amin < 1536B
+static TickType_t g_app_core0_stack_last_sample_tick = 0;
+static uint32_t g_app_core0_stack_cur_free_bytes = 0;
+static uint32_t g_app_core0_stack_min_free_bytes = 0;
+static bool g_ble_qso_pick_mode = false;
+static bool g_ble_dump_in_progress = false;
+static UIMode g_ble_qso_return_mode = UIMode::RX;
 
 static void host_handle_line(const std::string& line);
 static void save_station_data();
@@ -851,34 +865,21 @@ static void ble_update_name_from_station(bool restart_adv);
 static void ble_mirror_tick();
 static void ble_countdown_tick();
 static void enter_mode(UIMode new_mode);
+static void apply_ble_enabled_policy(bool runtime_apply);
+static std::string menu_sleep_batt_line();
 static bool g_rx_dirty = false;
 #if ENABLE_BLE
 static void ble_enter_text_mode();
 static void ble_exit_text_mode();
 static bool ble_text_target_active();
 static void ble_commit_text_input(const BleUiInput& input);
+static void ble_start_qso_pick_mode();
+static void ble_cancel_qso_pick_mode();
+static void ble_try_dump_qso_file_by_key(char key);
 #endif
 
 
 
-static std::vector<std::string> g_list_lines = {
-    "10:34 20m WA4HR",
-    "10:36 40m K4ABC",
-    "10:40 17m DL2XYZ",
-    "10:45 30m JA1ZZZ",
-    "10:50 15m VK2AAA",
-    "10:52 10m KH6BBB"
-};
-static int list_page = 0;
-static std::vector<std::string> g_uac_lines = {
-    "HOST MODE: USB serial",
-    "Commands:",
-    "WRITEBIN <file> <size> <crc32_hex>",
-    "WRITE/APPEND",
-    "READ/DELETE",
-    "LIST/INFO/HELP",
-    "EXIT to leave"
-};
 static std::vector<std::string> g_ctrl_lines = {
     "C MODE: USB serial",
     "Commands:",
@@ -986,6 +987,8 @@ static std::string g_free_text = "TNX 73";
 static std::string g_call = "YOURCALL";
 static std::string g_grid = "CM97";
 bool g_decode_enabled = true;
+int g_time_osr = 1;
+int g_freq_osr = 1;
 static OffsetSrc g_offset_src = OffsetSrc::RANDOM;
 static RadioType g_radio = RadioType::QMX;
 static constexpr size_t kIgnorePrefixTextMaxLen = 64;
@@ -1046,6 +1049,7 @@ static int64_t s_last_tx_slot_idx = -1000;  // Track last TX slot for retry sche
 static void enqueue_beacon_cq();
 static void qso_load_file_list();
 static void qso_load_entries(const std::string& path);
+static void qso_draw_page();
 
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter = -1);
 static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd);
@@ -1604,8 +1608,8 @@ struct WAVHeader {
   mon_cfg.f_min = 200.0f;
   mon_cfg.f_max = 3000.0f;
   mon_cfg.sample_rate = FT8_SAMPLE_RATE;
-  mon_cfg.time_osr = 1;
-  mon_cfg.freq_osr = 1;
+  mon_cfg.time_osr = g_time_osr;
+  mon_cfg.freq_osr = g_freq_osr;
   mon_cfg.protocol = FTX_PROTOCOL_FT8;
 
   monitor_t mon;
@@ -1774,7 +1778,7 @@ static void apply_radio_profile_binding() {
   audio_source_set_backend(binding.audio_backend);
   radio_control_set_backend(binding.radio_backend);
   if (audio_source_is_streaming() && prev_audio != binding.audio_backend) {
-    ESP_LOGW(TAG, "Audio backend changed while streaming; restart HOST mode to apply (%s -> %s)",
+    ESP_LOGW(TAG, "Audio backend changed while streaming; stop/start audio to apply (%s -> %s)",
              audio_source_backend_name(prev_audio),
              audio_source_backend_name(binding.audio_backend));
   }
@@ -1828,12 +1832,11 @@ static std::string clamp_ignore_prefix_text(const std::string& s) {
   return s.substr(0, kIgnorePrefixTextMaxLen);
 }
 
-static std::string battery_status_line() {
+static std::string menu_sleep_batt_line() {
   int level = (int)M5.Power.getBatteryLevel();
-  bool charging = M5.Power.isCharging();
   if (level < 0 || level > 100) level = 0;
   char buf[32];
-  snprintf(buf, sizeof(buf), "Batt:%3d%%%s", level, charging ? " CHG" : "");
+  snprintf(buf, sizeof(buf), "Sleep/Batt %d%%", level);
   return buf;
 }
 
@@ -2891,7 +2894,7 @@ static void draw_menu_view() {
   lines.push_back(std::string("F:") + head_trim(g_free_text, 16));
   lines.push_back(std::string("Call:") + elide_right(menu_edit_idx == 3 ? menu_edit_buf : g_call));
   lines.push_back(std::string("Grid:") + elide_right(menu_edit_idx == 4 ? menu_edit_buf : g_grid));
-  lines.push_back(std::string("Sleep:") + (M5.Power.isCharging() ? "press" : "USB?"));
+  lines.push_back(menu_sleep_batt_line());
 
   lines.push_back(std::string("Offset:") + offset_name(g_offset_src));
   if (menu_edit_idx == 7) {
@@ -2902,7 +2905,7 @@ static void draw_menu_view() {
   lines.push_back(std::string("Radio:") + radio_name(g_radio));
   lines.push_back(std::string("IgnoreList:") + head_trim(g_ignore_prefix_text, 10));
   lines.push_back(std::string("C:") + head_trim(expand_comment1(), 16));
-  lines.push_back(battery_status_line());
+  lines.push_back(std::string("BLE ") + (g_ble_enabled ? "ON" : "OFF"));
 
   // Page 2 content (index 12+)
   lines.push_back(std::string("RxTxLog:") + (g_rxtx_log ? "ON" : "OFF"));
@@ -2931,7 +2934,7 @@ static void draw_menu_view() {
   }
   ui_draw_list(lines, menu_page, highlight_abs);
   // Draw battery icon on visible battery line
-  int battery_abs_idx = (int)lines.size() - 1;
+  int battery_abs_idx = 5;
   if (menu_page == (battery_abs_idx / 6)) {
     int line_on_page = battery_abs_idx % 6;
     const int line_h = 19;
@@ -2975,9 +2978,35 @@ static void draw_status_view() {
   }
 }
 
+static void debug_ensure_hud_lines() {
+  while (g_debug_lines.size() < DEBUG_HUD_LINES) {
+    g_debug_lines.emplace_back();
+  }
+}
+
+static void debug_update_app_core0_stack_hud(bool redraw_now) {
+  debug_ensure_hud_lines();
+  char cur_line[20];
+  char min_line[20];
+  std::snprintf(cur_line, sizeof(cur_line), "Acur %luB",
+                (unsigned long)g_app_core0_stack_cur_free_bytes);
+  std::snprintf(min_line, sizeof(min_line), "Amin %luB",
+                (unsigned long)g_app_core0_stack_min_free_bytes);
+  g_debug_lines[0] = cur_line;
+  g_debug_lines[1] = min_line;
+  if (redraw_now && ui_mode == UIMode::DEBUG) {
+    ui_draw_debug(g_debug_lines, debug_page);
+  }
+}
+
 static void debug_log_line(const std::string& msg) {
+  debug_ensure_hud_lines();
   if (g_debug_lines.size() >= DEBUG_MAX_LINES) {
-    g_debug_lines.erase(g_debug_lines.begin());
+    if (g_debug_lines.size() > DEBUG_HUD_LINES) {
+      g_debug_lines.erase(g_debug_lines.begin() + DEBUG_HUD_LINES);
+    } else {
+      return;
+    }
   }
   g_debug_lines.push_back(msg);
   debug_page = (int)((g_debug_lines.size() - 1) / 6);
@@ -2995,6 +3024,7 @@ static int page_count(int items, int page_size) {
 }
 
 static void ble_notify_payload(const std::string& payload) {
+  if (!g_ble_enabled) return;
   if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
   if (!gatt_tx_handle) return;
   struct os_mbuf* om = ble_hs_mbuf_from_flat(payload.data(), payload.size());
@@ -3002,6 +3032,36 @@ static void ble_notify_payload(const std::string& payload) {
   int rc = ble_gatts_notify_custom(g_conn_handle, gatt_tx_handle, om);
   if (rc != 0) {
     ESP_LOGD(BT_TAG, "notify failed rc=%d", rc);
+  }
+}
+
+static void apply_ble_enabled_policy(bool runtime_apply) {
+  g_time_osr = 1;
+  g_freq_osr = 1;
+  if (!runtime_apply) return;
+
+  if (!g_ble_enabled) {
+    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+      ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+    if (g_ble_synced) {
+      ble_gap_adv_stop();
+    }
+    g_ble_last_payload.clear();
+    g_ble_last_tick_slot = -1;
+    g_ble_last_tick_sec = -1;
+    g_ble_text_mode = false;
+    g_ble_qso_pick_mode = false;
+    g_ble_dump_in_progress = false;
+    if (ble_cmd_queue) xQueueReset(ble_cmd_queue);
+    return;
+  }
+
+  g_ble_force_send = true;
+  g_ble_last_tick_slot = -1;
+  g_ble_last_tick_sec = -1;
+  if (g_ble_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+    ble_app_advertise();
   }
 }
 
@@ -3041,7 +3101,7 @@ static void ble_update_name_from_station(bool restart_adv) {
   g_ble_adv_name = desired;
   ble_svc_gap_device_name_set(g_ble_adv_name.c_str());
 
-  if (restart_adv && g_ble_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+  if (restart_adv && g_ble_enabled && g_ble_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
     ble_app_advertise();
   }
 }
@@ -3052,10 +3112,8 @@ static const char* ble_page_label(UIMode mode) {
     case UIMode::TX: return "TX";
     case UIMode::BAND: return "BAND";
     case UIMode::MENU: return "MENU";
-    case UIMode::HOST: return "HOST";
     case UIMode::CONTROL: return "CONTROL";
     case UIMode::DEBUG: return "DEBUG";
-    case UIMode::LIST: return "LIST";
     case UIMode::STATUS: return "STATUS";
     case UIMode::QSO: return "QSO";
   }
@@ -3084,10 +3142,6 @@ static void ble_page_meta(int& cur, int& total) {
     case UIMode::DEBUG:
       total = page_count((int)g_debug_lines.size(), 6);
       cur = debug_page + 1;
-      break;
-    case UIMode::LIST:
-      total = page_count((int)g_list_lines.size(), 6);
-      cur = list_page + 1;
       break;
     case UIMode::QSO:
       total = page_count((int)g_q_lines.size(), 6);
@@ -3181,7 +3235,72 @@ static std::string ble_timing_token(int sec, bool even_slot, bool txing) {
   return even_slot ? ":" : ".";
 }
 
+static void ble_notify_line(const std::string& raw) {
+  std::string line = raw;
+  while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+    line.pop_back();
+  }
+  ble_notify_payload(line + "\n");
+}
+
+static void ble_start_qso_pick_mode() {
+  if (g_ble_qso_pick_mode) return;
+  g_ble_qso_return_mode = ui_mode;
+  g_ble_qso_pick_mode = true;
+  g_ble_dump_in_progress = false;
+  g_q_show_entries = false;
+  g_q_page_view = QPageView::Default;
+  q_page = 0;
+  qso_load_file_list();
+  enter_mode(UIMode::QSO);
+  qso_draw_page();
+  g_ble_force_send = true;
+}
+
+static void ble_cancel_qso_pick_mode() {
+  if (!g_ble_qso_pick_mode) return;
+  g_ble_qso_pick_mode = false;
+  g_ble_dump_in_progress = false;
+  if (ble_cmd_queue) xQueueReset(ble_cmd_queue);
+  enter_mode(g_ble_qso_return_mode);
+  g_ble_force_send = true;
+}
+
+static void ble_dump_qso_file(const std::string& file_name) {
+  g_ble_dump_in_progress = true;
+  std::string full_path = std::string("/spiffs/") + file_name;
+  ble_notify_line(std::string("--- <") + file_name + "> ---");
+
+  FILE* f = fopen(full_path.c_str(), "r");
+  if (!f) {
+    ble_notify_line("Open fail");
+  } else {
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+      ble_notify_line(line);
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    fclose(f);
+  }
+  ble_notify_line("--- EOF ---");
+
+  g_ble_dump_in_progress = false;
+  g_ble_qso_pick_mode = false;
+  if (ble_cmd_queue) xQueueReset(ble_cmd_queue);
+  enter_mode(g_ble_qso_return_mode);
+  g_ble_force_send = true;
+}
+
+static void ble_try_dump_qso_file_by_key(char key) {
+  if (key < '1' || key > '6') return;
+  int idx = q_page * 6 + (key - '1');
+  if (idx < 0 || idx >= (int)g_q_files.size()) return;
+  ble_dump_qso_file(g_q_files[idx]);
+}
+
 static void ble_mirror_tick() {
+  if (!g_ble_enabled) return;
+  if (g_ble_dump_in_progress) return;
   if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
 
   std::vector<std::string> lines;
@@ -3219,6 +3338,8 @@ static void ble_mirror_tick() {
 }
 
 static void ble_countdown_tick() {
+  if (!g_ble_enabled) return;
+  if (g_ble_dump_in_progress) return;
   if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
 
   int64_t slot_idx = 0;
@@ -3261,6 +3382,7 @@ static void nimble_host_task(void* param) {
 }
 
 static void ble_app_advertise(void) {
+  if (!g_ble_enabled) return;
   if (!g_ble_synced) return;
   if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) return;
 
@@ -3292,6 +3414,11 @@ static void ble_app_advertise(void) {
 #else  // ENABLE_BLE
 static bool ble_pop_input(BleUiInput& out) { (void)out; return false; }
 static void ble_update_name_from_station(bool restart_adv) { (void)restart_adv; }
+static void apply_ble_enabled_policy(bool runtime_apply) {
+  (void)runtime_apply;
+  g_time_osr = 1;
+  g_freq_osr = 1;
+}
 static void ble_mirror_tick() {}
 static void ble_countdown_tick() {}
 static void init_bluetooth(void) {}
@@ -3654,10 +3781,12 @@ static void load_station_data() {
   // Load-time defaults for fixed/runtime settings.
   g_rtc_comp = kRtcCompFixed;
   g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;
+  g_ble_enabled = true;
 
   FILE* f = fopen(STATION_FILE, "r");
   if (!f) {
     autoseq_set_max_retry(g_autoseq_max_retry);
+    apply_ble_enabled_policy(false);
     return;
   }
   char line[128];
@@ -3707,6 +3836,8 @@ static void load_station_data() {
       g_active_band_text = trim_copy(line + 13);
     } else if (sscanf(line, "autoseq_max_retry=%d", &val) == 1) {
       if (val >= 0) g_autoseq_max_retry = val;
+    } else if (sscanf(line, "ble_enabled=%d", &val) == 1) {
+      g_ble_enabled = (val != 0);
     } else if (sscanf(line, "rtc_comp=%d", &val) == 1) {
       // Legacy key kept for file compatibility; ignored (fixed to kRtcCompFixed).
     } else {
@@ -3726,6 +3857,7 @@ static void load_station_data() {
   rebuild_active_bands();
   rebuild_ignore_prefixes();
   g_beacon = BeaconMode::OFF; // force off on load
+  apply_ble_enabled_policy(false);
 }
 
 static void save_station_data() {
@@ -3757,6 +3889,7 @@ static void save_station_data() {
   fprintf(f, "rtc_sleep_epoch=%lld\n", (long long)g_rtc_sleep_epoch);
   fprintf(f, "rtc_comp=%d\n", kRtcCompFixed);
   fprintf(f, "autoseq_max_retry=%d\n", g_autoseq_max_retry);
+  fprintf(f, "ble_enabled=%d\n", g_ble_enabled ? 1 : 0);
   fclose(f);
 }
 
@@ -3786,6 +3919,10 @@ static void enter_mode(UIMode new_mode) {
     }
     status_edit_idx = -1;
     status_edit_buffer.clear();
+  }
+  if (new_mode != UIMode::QSO) {
+    g_ble_qso_pick_mode = false;
+    g_ble_dump_in_progress = false;
   }
   ui_mode = new_mode;
   rx_flash_idx = -1;
@@ -3825,29 +3962,6 @@ static void enter_mode(UIMode new_mode) {
       } else {
         debug_log_line("USB serial not ready");
       }
-      break;
-  case UIMode::HOST:
-    // Start UAC audio streaming
-    g_uac_lines.clear();
-    g_uac_lines.push_back("USB Audio Host Mode");
-    apply_radio_profile_binding();
-    if (audio_source_start()) {
-      g_decode_enabled = true;
-      ui_set_paused(false);
-      ui_clear_waterfall();
-      radio_control_on_audio_start();
-      g_uac_lines.push_back("Starting USB host...");
-      g_uac_lines.push_back("Connect 24-bit/48kHz");
-      g_uac_lines.push_back("stereo USB mic");
-    } else {
-      g_uac_lines.push_back("Failed to start UAC");
-        debug_log_line("UAC start failed");
-      }
-      ui_draw_list(g_uac_lines, 0, -1);
-      break;
-    case UIMode::LIST:
-      list_page = 0;
-      ui_draw_list(g_list_lines, list_page, -1);
       break;
     case UIMode::QSO:
       g_q_show_entries = false;
@@ -4025,6 +4139,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   ui_mode = UIMode::RX;
   load_station_data();
   init_bluetooth();
+  apply_ble_enabled_policy(true);
   apply_radio_profile_binding();
   update_autoseq_cq_type();
 
@@ -4052,6 +4167,15 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     debug_log_line(buf);
   }
   log_heap("BOOT");
+
+  g_app_core0_stack_last_sample_tick = xTaskGetTickCount();
+  {
+    UBaseType_t free_words = uxTaskGetStackHighWaterMark2(NULL);
+    uint32_t free_bytes = (uint32_t)free_words * (uint32_t)sizeof(StackType_t);
+    g_app_core0_stack_cur_free_bytes = free_bytes;
+    g_app_core0_stack_min_free_bytes = free_bytes;
+    debug_update_app_core0_stack_hud(false);
+  }
 
   // Key injection queue for UART0 RX testing
   s_key_inject_queue = xQueueCreate(32, sizeof(char));
@@ -4084,14 +4208,18 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     if (c == 0) {
       BleUiInput ble_input{};
       if (ble_pop_input(ble_input)) {
-        c_from_ble = true;
-        last_key = 0;  // allow repeated BLE commands without local debounce suppression
 #if ENABLE_BLE
-        if (g_ble_text_mode) {
-          ble_commit_text_input(ble_input);
+        if (!g_ble_enabled || g_ble_dump_in_progress) {
+          c_from_ble = false;
         } else {
-          c = ble_parse_ui_command(ble_input.data, ble_input.len);
-          if (c == 0) c_from_ble = false;
+          c_from_ble = true;
+          last_key = 0;  // allow repeated BLE commands without local debounce suppression
+          if (g_ble_text_mode) {
+            ble_commit_text_input(ble_input);
+          } else {
+            c = ble_parse_ui_command(ble_input.data, ble_input.len);
+            if (c == 0) c_from_ble = false;
+          }
         }
 #endif
       }
@@ -4100,6 +4228,17 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     // BLE remote UI push model: always compare and send latest 7-line snapshot when changed.
     ble_mirror_tick();
     ble_countdown_tick();
+    TickType_t now_ticks = xTaskGetTickCount();
+    if ((now_ticks - g_app_core0_stack_last_sample_tick) >= pdMS_TO_TICKS(1000)) {
+      g_app_core0_stack_last_sample_tick = now_ticks;
+      UBaseType_t free_words = uxTaskGetStackHighWaterMark2(NULL);
+      uint32_t free_bytes = (uint32_t)free_words * (uint32_t)sizeof(StackType_t);
+      g_app_core0_stack_cur_free_bytes = free_bytes;
+      if (g_app_core0_stack_min_free_bytes == 0 || free_bytes < g_app_core0_stack_min_free_bytes) {
+        g_app_core0_stack_min_free_bytes = free_bytes;
+      }
+      debug_update_app_core0_stack_hud(true);
+    }
     // Startup screen overlay on RX page: show until any key press, and only once
     if (g_startup_active) {
       if (c == 0) {
@@ -4134,46 +4273,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     check_slot_boundary();  // TX trigger at slot boundary (matching reference architecture)
     tx_tick();              // Process TX state machine (single-threaded, non-blocking)
 
-  // HOST mode: UAC audio streaming - update status display
-  if (ui_mode == UIMode::HOST) {
-    // Update status display periodically
-    static TickType_t last_update = 0;
-    TickType_t now = xTaskGetTickCount();
-    if (now - last_update > pdMS_TO_TICKS(500)) {
-      last_update = now;
-      // Update status line (keep only header)
-      if (g_uac_lines.size() > 1) {
-        g_uac_lines.resize(1);
-      }
-      g_uac_lines.push_back(audio_source_get_status_string());
-      if (audio_source_is_streaming()) {
-        g_uac_lines.push_back("Decoding FT8...");
-        // Show debug lines with raw USB sample data
-        const char* dbg1 = audio_source_get_debug_line1();
-        const char* dbg2 = audio_source_get_debug_line2();
-        if (dbg1[0]) g_uac_lines.push_back(dbg1);
-        if (dbg2[0]) g_uac_lines.push_back(dbg2);
-      }
-      ui_draw_list(g_uac_lines, 0, -1);
-    }
-    // Handle keyboard - only 'h'/'H' to exit
-    if (c == 0) {
-      last_key = 0;
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
-    }
-    if (c == last_key) {
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
-    }
-    last_key = c;
-    if (c == 'h' || c == 'H') {
-      enter_mode(UIMode::RX);
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-    continue;
-  }
-
   // CONTROL mode: legacy host serial protocol over USB only
   if (ui_mode == UIMode::CONTROL) {
     poll_host_uart();
@@ -4191,7 +4290,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       continue;
     }
     last_key = c;
-    if (c == 'c' || c == 'C' || c == 'h' || c == 'H') {
+    if (c == 'c' || c == 'C') {
       enter_mode(UIMode::RX);
     }
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -4327,10 +4426,21 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         switched = true;
       }
       else if (c == 'q' || c == 'Q') { cancel_status_edit(); enter_mode(ui_mode == UIMode::QSO ? UIMode::RX : UIMode::QSO); switched = true; }
-      else if (c == 'h' || c == 'H') { cancel_status_edit(); enter_mode(ui_mode == UIMode::HOST ? UIMode::RX : UIMode::HOST); switched = true; }
-      else if (c == 'c' || c == 'C') { cancel_status_edit(); enter_mode(ui_mode == UIMode::CONTROL ? UIMode::RX : UIMode::CONTROL); switched = true; }
+      else if (c == 'c' || c == 'C') {
+#if ENABLE_BLE
+        if (c_from_ble) {
+          cancel_status_edit();
+          ble_start_qso_pick_mode();
+          switched = true;
+        } else
+#endif
+        {
+          cancel_status_edit();
+          enter_mode(ui_mode == UIMode::CONTROL ? UIMode::RX : UIMode::CONTROL);
+          switched = true;
+        }
+      }
       else if (c == 'd' || c == 'D') { cancel_status_edit(); enter_mode(ui_mode == UIMode::DEBUG ? UIMode::RX : UIMode::DEBUG); switched = true; }
-      else if (c == 'l' || c == 'L') { cancel_status_edit(); enter_mode(ui_mode == UIMode::LIST ? UIMode::RX : UIMode::LIST); switched = true; }
       else if (c == 's' || c == 'S') { cancel_status_edit(); enter_mode(ui_mode == UIMode::STATUS ? UIMode::RX : UIMode::STATUS); switched = true; }
     }
 
@@ -4439,15 +4549,18 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             status_edit_idx = 1;
             draw_status_view();
             if (!audio_source_is_streaming()) {
-              debug_log_line("Starting UAC host...");
+              debug_log_line("UAC2 start");
               apply_radio_profile_binding();
+              debug_log_line("UAC2 bind");
               if (!audio_source_start()) {
-                debug_log_line("UAC start failed");
+                debug_log_line("UAC2 afail");
               } else {
+                debug_log_line("UAC2 aok");
                 g_decode_enabled = true;
                 ui_set_paused(false);
                 ui_clear_waterfall();
-                radio_control_on_audio_start();
+                esp_err_t rc = radio_control_on_audio_start();
+                debug_log_line(rc == ESP_OK ? "UAC2 catok" : "UAC2 catng");
               }
             } else {
               int freq_hz = g_bands[g_band_sel].freq * 1000;
@@ -4545,15 +4658,21 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           }
           break;
         }
-        case UIMode::LIST: {
-          if (c == ';') {
-            if (list_page > 0) { list_page--; ui_draw_list(g_list_lines, list_page, -1); }
-          } else if (c == '.') {
-            if ((list_page + 1) * 6 < (int)g_list_lines.size()) { list_page++; ui_draw_list(g_list_lines, list_page, -1); }
-          }
-          break;
-        }
         case UIMode::QSO: {
+#if ENABLE_BLE
+          if (g_ble_qso_pick_mode && c_from_ble) {
+            if (c == ';') {
+              if (q_page > 0) { q_page--; qso_draw_page(); }
+            } else if (c == '.') {
+              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; qso_draw_page(); }
+            } else if (c >= '1' && c <= '6') {
+              ble_try_dump_qso_file_by_key(c);
+            } else if (c == '`') {
+              ble_cancel_qso_pick_mode();
+            }
+            break;
+          }
+#endif
           if (!g_q_show_entries) {
             if (c == ';') {
               if (q_page > 0) { q_page--; qso_draw_page(); }
@@ -4602,7 +4721,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         }
         case UIMode::CONTROL:
           break;
-        case UIMode::HOST:
         case UIMode::MENU: {
           if (ui_mode == UIMode::MENU) {
             if (menu_long_edit) {
@@ -4786,26 +4904,21 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 if (c_from_ble) ble_enter_text_mode();
 #endif
               } else if (c == '6') {
-                  if (M5.Power.isCharging()) {
-                    ESP_LOGI(TAG, "Entering deep sleep (GPIO0 wake)");
-                    // Save current accurate time for compensation after wake-up
-                    if (rtc_valid) {
-                      g_rtc_sleep_epoch = rtc_epoch_base +
-                          (esp_timer_get_time() / 1000 - rtc_ms_start) / 1000;
-                      rtc_sync_to_hw();  // Sync to hardware RTC
-                      save_station_data();
-                      ESP_LOGI(TAG, "Saved sleep epoch: %ld, comp=%d",
-                               (long)g_rtc_sleep_epoch, g_rtc_comp);
-                    }
-                    M5.Display.sleep();
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                    // Configure GPIO0 as wake-up source (active low)
-                    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
-                    esp_deep_sleep_start();
-                  } else {
-                    debug_log_line("Sleep skipped: not charging");
-                    draw_menu_view();
-                  }
+                ESP_LOGI(TAG, "Entering deep sleep (GPIO0 wake)");
+                // Save current accurate time for compensation after wake-up
+                if (rtc_valid) {
+                  g_rtc_sleep_epoch = rtc_epoch_base +
+                      (esp_timer_get_time() / 1000 - rtc_ms_start) / 1000;
+                  rtc_sync_to_hw();  // Sync to hardware RTC
+                  save_station_data();
+                  ESP_LOGI(TAG, "Saved sleep epoch: %ld, comp=%d",
+                           (long)g_rtc_sleep_epoch, g_rtc_comp);
+                }
+                M5.Display.sleep();
+                vTaskDelay(pdMS_TO_TICKS(100));
+                // Configure GPIO0 as wake-up source (active low)
+                esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+                esp_deep_sleep_start();
               }
             } else if (menu_page == 1) {
                 if (c == '1') {
@@ -4845,6 +4958,11 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 #if ENABLE_BLE
                   if (c_from_ble) ble_enter_text_mode();
 #endif
+                } else if (c == '6') {
+                  g_ble_enabled = !g_ble_enabled;
+                  apply_ble_enabled_policy(true);
+                  save_station_data();
+                  draw_menu_view();
                 }
             } else if (menu_page == 2) {
               if (c == '1') {
@@ -4911,7 +5029,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
 extern "C" void app_main(void) {
   // Run the main application loop on core0.
-  xTaskCreatePinnedToCore(app_task_core0, "app_core0", 12288, nullptr, 5, nullptr, 0);
+  xTaskCreatePinnedToCore(app_task_core0, "app_core0", APP_CORE0_STACK_BYTES, nullptr, 5, nullptr, 0);
 }
 static void draw_status_line(int idx, const std::string& text, bool highlight) {
   const int line_h = 19;

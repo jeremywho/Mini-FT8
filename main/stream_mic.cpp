@@ -17,6 +17,8 @@ extern "C" {
 
 static const char* TAG_MIC = "FT8_MIC";
 extern bool g_streaming;  // true when WAV playback is running
+extern int g_time_osr;
+extern int g_freq_osr;
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
 int64_t rtc_now_ms();
 
@@ -70,8 +72,8 @@ void stream_mic_task(void* /*arg*/) {
   mon_cfg.f_min = 200.0f;
   mon_cfg.f_max = 3000.0f;
   mon_cfg.sample_rate = FT8_SAMPLE_RATE;
-  mon_cfg.time_osr = 1;
-  mon_cfg.freq_osr = 1;
+  mon_cfg.time_osr = g_time_osr;
+  mon_cfg.freq_osr = g_freq_osr;
   mon_cfg.protocol = FTX_PROTOCOL_FT8;
 
   monitor_t mon;
