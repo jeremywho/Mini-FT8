@@ -1953,10 +1953,8 @@ static std::string normalize_time_hms(const std::string& src) {
 static std::string menu_sleep_batt_line() {
   int level = (int)M5.Power.getBatteryLevel();
   if (level < 0 || level > 100) level = 0;
-  const std::string hms = normalize_time_hms(g_time);
-  const std::string hhmm = (hms.size() >= 5 && hms[2] == ':') ? hms.substr(0, 5) : std::string("--:--");
   char buf[40];
-  snprintf(buf, sizeof(buf), "Sleep %s Batt %d%%", hhmm.c_str(), level);
+  snprintf(buf, sizeof(buf), "Sleep/Batt %d%%", level);
   return buf;
 }
 
@@ -3392,7 +3390,7 @@ static void ble_cancel_qso_pick_mode() {
 static void ble_dump_qso_file(const std::string& file_name) {
   g_ble_dump_in_progress = true;
   std::string full_path = std::string("/spiffs/") + file_name;
-  ble_notify_line(std::string("--- <") + file_name + "> ---");
+  ble_notify_line(std::string("\n--- <") + file_name + "> ---");
 
   FILE* f = fopen(full_path.c_str(), "r");
   if (!f) {
@@ -4516,16 +4514,34 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       status_cursor_pos = -1;
     }
   };
-  if (!(ui_mode == UIMode::MENU && (menu_edit_idx >= 0 || menu_long_edit))) {
+  if (!(ui_mode == UIMode::MENU && (menu_edit_idx >= 0 || menu_long_edit || menu_delete_confirm))) {
       // Mode switch keys (disabled while editing in MENU)
       if (c == 'r' || c == 'R') { cancel_status_edit(); enter_mode(UIMode::RX); ui_force_redraw_rx(); ui_draw_rx(); switched = true; }
       else if (c == 't' || c == 'T') { cancel_status_edit(); enter_mode(ui_mode == UIMode::TX ? UIMode::RX : UIMode::TX); switched = true; }
       else if (c == 'b' || c == 'B') { cancel_status_edit(); enter_mode(ui_mode == UIMode::BAND ? UIMode::RX : UIMode::BAND); switched = true; }
-      else if (c == 'm' || c == 'M') { cancel_status_edit(); enter_mode(ui_mode == UIMode::MENU ? UIMode::RX : UIMode::MENU); switched = true; }
+      else if (c == 'm' || c == 'M') {
+        cancel_status_edit();
+        if (ui_mode == UIMode::MENU) {
+          if (menu_page == 0) {
+            enter_mode(UIMode::RX);
+          } else {
+            menu_page = 0;
+            draw_menu_view();
+          }
+        } else {
+          enter_mode(UIMode::MENU);
+        }
+        switched = true;
+      }
       else if (c == 'n' || c == 'N') {
         cancel_status_edit();
         if (ui_mode == UIMode::MENU) {
-          enter_mode(UIMode::RX);
+          if (menu_page == 1) {
+            enter_mode(UIMode::RX);
+          } else {
+            menu_page = 1;
+            draw_menu_view();
+          }
         } else {
           menu_page = 0;
           enter_mode(UIMode::MENU);
@@ -4537,7 +4553,12 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       else if (c == 'o' || c == 'O') {
         cancel_status_edit();
         if (ui_mode == UIMode::MENU) {
-          enter_mode(UIMode::RX);
+          if (menu_page == 2) {
+            enter_mode(UIMode::RX);
+          } else {
+            menu_page = 2;
+            draw_menu_view();
+          }
         } else {
           menu_page = 0;
           enter_mode(UIMode::MENU);
