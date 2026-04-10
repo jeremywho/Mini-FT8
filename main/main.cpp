@@ -2443,33 +2443,128 @@ static void fft_waterfall_tx_tone(uint8_t tone) {
   return val;
 }
 
+// ---- Static decode workspace (zero heap allocation) ----
+#define DEC_MAX       32
+#define DEC_TEXT_MAX  FTX_MAX_MESSAGE_LENGTH   // 64
+#define DEC_FIELD_MAX 20
+
+struct DecodeMsg {
+  char text[DEC_TEXT_MAX];
+  char field1[DEC_FIELD_MAX];
+  char field2[DEC_FIELD_MAX];
+  char field3[DEC_FIELD_MAX];
+  int  snr;
+  int  offset_hz;
+  int  slot_id;
+  float time_s;
+  bool is_cq;
+  bool is_to_me;
+};
+
+static DecodeMsg s_dec[DEC_MAX];
+static int       s_dec_count;
+
+// Plain-C field parser: tokenize text into field1/field2/field3.
+// Equivalent to the old fill_fields_from_text lambda but uses no heap.
+static void dec_fill_fields(DecodeMsg* d) {
+  d->field1[0] = d->field2[0] = d->field3[0] = '\0';
+  char tmp[DEC_TEXT_MAX];
+  strncpy(tmp, d->text, sizeof(tmp));
+  tmp[sizeof(tmp) - 1] = '\0';
+
+  char* saveptr = nullptr;
+  char* toks[8];
+  int ntoks = 0;
+  for (char* p = strtok_r(tmp, " ", &saveptr); p && ntoks < 8; p = strtok_r(nullptr, " ", &saveptr)) {
+    toks[ntoks++] = p;
+  }
+  if (ntoks == 0) return;
+
+  // Helpers
+  auto all_digits = [](const char* s, int len) {
+    for (int i = 0; i < len; ++i) if (s[i] < '0' || s[i] > '9') return false;
+    return true;
+  };
+  auto all_alpha = [](const char* s, int len) {
+    for (int i = 0; i < len; ++i) {
+      char c = s[i];
+      if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) return false;
+    }
+    return true;
+  };
+
+  // CQ <short_token> CALL GRID pattern
+  if (strcmp(toks[0], "CQ") == 0 && ntoks >= 2) {
+    int len1 = (int)strlen(toks[1]);
+    bool short_tok = (len1 <= 3 && all_digits(toks[1], len1)) ||
+                     (len1 <= 4 && all_alpha(toks[1], len1));
+    if (short_tok) {
+      strncpy(d->field1, toks[1], DEC_FIELD_MAX - 1); d->field1[DEC_FIELD_MAX - 1] = '\0';
+      if (ntoks > 2) { strncpy(d->field2, toks[2], DEC_FIELD_MAX - 1); d->field2[DEC_FIELD_MAX - 1] = '\0'; }
+      if (ntoks > 3) {
+        d->field3[0] = '\0';
+        for (int i = 3; i < ntoks; ++i) {
+          if (i > 3) strncat(d->field3, " ", DEC_FIELD_MAX - strlen(d->field3) - 1);
+          strncat(d->field3, toks[i], DEC_FIELD_MAX - strlen(d->field3) - 1);
+        }
+      }
+      return;
+    }
+  }
+
+  // Default: first 2 tokens + remainder
+  strncpy(d->field1, toks[0], DEC_FIELD_MAX - 1); d->field1[DEC_FIELD_MAX - 1] = '\0';
+  if (ntoks > 1) { strncpy(d->field2, toks[1], DEC_FIELD_MAX - 1); d->field2[DEC_FIELD_MAX - 1] = '\0'; }
+  if (ntoks > 2) {
+    d->field3[0] = '\0';
+    for (int i = 2; i < ntoks; ++i) {
+      if (i > 2) strncat(d->field3, " ", DEC_FIELD_MAX - strlen(d->field3) - 1);
+      strncat(d->field3, toks[i], DEC_FIELD_MAX - strlen(d->field3) - 1);
+    }
+  }
+}
+
+// Plain-C normalize: strip <>, uppercase, write into out[out_sz].
+static void dec_normalize_call(const char* src, char* out, int out_sz) {
+  const char* p = src;
+  if (*p == '<') ++p;
+  int len = (int)strlen(p);
+  if (len > 0 && p[len - 1] == '>') --len;
+  if (len >= out_sz) len = out_sz - 1;
+  for (int i = 0; i < len; ++i) out[i] = (char)toupper((unsigned char)p[i]);
+  out[len] = '\0';
+}
+
+// Sort comparator: to_me first (0), then CQ (1), then others (2)
+static int dec_sort_cmp(const void* a, const void* b) {
+  const DecodeMsg* da = (const DecodeMsg*)a;
+  const DecodeMsg* db = (const DecodeMsg*)b;
+  int ga = da->is_to_me ? 0 : (da->is_cq ? 1 : 2);
+  int gb = db->is_to_me ? 0 : (db->is_cq ? 1 : 2);
+  return ga - gb;
+}
+
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui) {
-  // ==== HEAP STRESS INSTRUMENTATION ====
-  size_t heap_entry  = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  // ---- heap instrumentation ----
+  size_t heap_entry = heap_caps_get_free_size(MALLOC_CAP_8BIT);
   size_t heap_entry_largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-  size_t heap_entry_min = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
   UBaseType_t stack_hw_entry = uxTaskGetStackHighWaterMark(NULL);
   ESP_LOGW(TAG, "DECODE_HEAP ENTER: free=%u largest=%u alltime_min=%u stack_hw=%u",
            (unsigned)heap_entry, (unsigned)heap_entry_largest,
-           (unsigned)heap_entry_min, (unsigned)stack_hw_entry);
-  // ==== END INSTRUMENTATION ====
+           (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
+           (unsigned)stack_hw_entry);
+
+  s_dec_count = 0;
 
   const int max_cand = 50;
   static ftx_candidate_t candidates[max_cand];
   int num_candidates = ftx_find_candidates(&mon->wf, max_cand, candidates, 5);
   ESP_LOGI(TAG, "Candidates found: %d", num_candidates);
 
-
   // ---- slot index + once-per-slot hashtable maintenance ----
-  int64_t slot_idx = -1;
-  if (g_decode_slot_idx >= 0) {
-    slot_idx = g_decode_slot_idx;
-  } else {
-    slot_idx = rtc_now_ms() / 15000LL;
-  }
+  int64_t slot_idx = (g_decode_slot_idx >= 0) ? g_decode_slot_idx : rtc_now_ms() / 15000LL;
   int slot_id = (int)(slot_idx & 1);
 
-  // Age callsign hash table once per slot
   static int64_t s_last_aged_slot = -1;
   if (slot_idx != s_last_aged_slot) {
     s_last_aged_slot = slot_idx;
@@ -2481,11 +2576,9 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   if (mon->wf.mag && mon->wf.num_blocks > 0) {
     const size_t total = (size_t)mon->wf.num_blocks * (size_t)mon->wf.block_stride;
     static uint32_t hist[256];
-    memset(hist, 0, sizeof(hist));               // <-- FIX
-
+    memset(hist, 0, sizeof(hist));
     for (size_t i = 0; i < total; ++i) hist[mon->wf.mag[i]]++;
-
-    uint64_t target = total * 25 / 100;          // <-- use lower percentile than median
+    uint64_t target = total * 25 / 100;
     uint64_t accum = 0;
     int noise_scaled = 0;
     for (int v = 0; v < 256; ++v) {
@@ -2495,136 +2588,66 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     noise_db = 0.5f * ((float)noise_scaled - 240.0f);
   }
 
-  //static float snr_to_2500 = 0.0f;
-  //static bool snr_to_2500_init = false;
+  // ---- mycall uppercase (stack, not heap) ----
+  char mycall_up[DEC_FIELD_MAX];
+  {
+    const char* src = g_call.c_str();
+    int len = (int)g_call.size();
+    if (len >= DEC_FIELD_MAX) len = DEC_FIELD_MAX - 1;
+    for (int i = 0; i < len; ++i) mycall_up[i] = (char)toupper((unsigned char)src[i]);
+    mycall_up[len] = '\0';
+  }
 
-  //if (!snr_to_2500_init) {
-  //  float bw_eff = 1.5f / (mon->symbol_period * cfg->freq_osr); // Hz
-  //  snr_to_2500 = 10.0f * log10f(bw_eff / 2500.0f);
-  //  snr_to_2500_init = true;
-  //}
-
-  auto to_upper = [](std::string s) {
-    for (auto& ch : s) ch = (char)toupper((unsigned char)ch);
-    return s;
-  };
-  std::string mycall_up = to_upper(g_call);
-
-  auto fill_fields_from_text = [&](UiRxLine& line) {
-    // Split tokens
-    std::vector<std::string> toks;
-    {
-      std::istringstream iss(line.text);
-      std::string tok;
-      while (iss >> tok) toks.push_back(tok);
-    }
-
-    auto is_digits = [](const std::string& s) {
-      return !s.empty() && std::all_of(s.begin(), s.end(),
-        [](char c){ return c >= '0' && c <= '9'; });
-    };
-    auto is_alpha = [](const std::string& s) {
-      return !s.empty() && std::all_of(s.begin(), s.end(),
-        [](char c){ return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); });
-    };
-
-    line.field1.clear(); line.field2.clear(); line.field3.clear();
-
-    // Heuristic: CQ <num/word> CALL GRID  (e.g. CQ DX W1XYZ FN31)
-    if (!toks.empty() && toks[0] == "CQ" && toks.size() >= 2) {
-      bool short_token = (toks[1].size() <= 3 && is_digits(toks[1])) ||
-                         (toks[1].size() <= 4 && is_alpha(toks[1]));
-      if (short_token) {
-        line.field1 = toks[1];
-        if (toks.size() > 2) line.field2 = toks[2];
-
-        // field3 = remainder starting at toks[3]
-        if (toks.size() > 3) {
-          line.field3.clear();
-          for (size_t i = 3; i < toks.size(); ++i) {
-            if (i > 3) line.field3.push_back(' ');
-            line.field3 += toks[i];
-          }
-        }
-        return;
-      }
-    }
-
-    // Default: first 2 tokens + remainder as field3
-    if (!toks.empty()) line.field1 = toks[0];
-    if (toks.size() > 1) line.field2 = toks[1];
-    if (toks.size() > 2) {
-      line.field3.clear();
-      for (size_t i = 2; i < toks.size(); ++i) {
-        if (i > 2) line.field3.push_back(' ');
-        line.field3 += toks[i];
-      }
-    }
-    
-  };
-
-  // ---- local message de-duplication like reference decode() ----
-  // Dedupe based on message.hash and payload bytes.
-  const int kMaxDecoded = 50; // keep <= max_cand
+  // ---- decode candidates into static s_dec[] ----
+  const int kMaxDecoded = 50;
   static ftx_message_t decoded[kMaxDecoded];
   static ftx_message_t* decoded_hashtable[kMaxDecoded];
   for (int i = 0; i < kMaxDecoded; ++i) decoded_hashtable[i] = nullptr;
   int num_decoded = 0;
 
-  std::vector<UiRxLine> ui_lines;
-  ui_lines.reserve(32);
-  std::vector<float> time_offsets;
-  time_offsets.reserve(32);
-
   if (num_candidates <= 0) {
-    ESP_LOGW(TAG, "No candidates found (injection will fill)");
-    // NOTE: early return removed for heap stress test — fall through to injection
+    ESP_LOGW(TAG, "No candidates found");
+    g_rx_lines.clear();
+    if (update_ui) { ui_set_rx_list(g_rx_lines); ui_draw_rx(); }
+    else g_rx_dirty = true;
+    g_decode_in_progress = false;
+    return;
   }
 
-  int decodedCount = 0;
-  std::unordered_map<std::string, int> seen_idx; // displayed-text -> ui_lines index
-
-  for (int i = 0; i < num_candidates; ++i) {
+  for (int i = 0; i < num_candidates && s_dec_count < DEC_MAX; ++i) {
     ftx_message_t message;
     ftx_decode_status_t status;
     memset(&message, 0, sizeof(message));
     memset(&status, 0, sizeof(status));
 
-    if (!ftx_decode_candidate(&mon->wf, &candidates[i], 25, &message, &status)) {
+    if (!ftx_decode_candidate(&mon->wf, &candidates[i], 25, &message, &status))
       continue;
-    }
 
-    // --- payload/hash dedupe (open addressing) ---
+    // payload/hash dedupe (open addressing)
     int idx_hash = (int)(message.hash % kMaxDecoded);
-    bool found_empty = false;
-    bool found_dup = false;
+    bool found_empty = false, found_dup = false;
     for (int probe = 0; probe < kMaxDecoded; ++probe) {
       ftx_message_t* p = decoded_hashtable[idx_hash];
-      if (p == nullptr) { found_empty = true; break; }
+      if (!p) { found_empty = true; break; }
       if (p->hash == message.hash &&
           0 == memcmp(p->payload, message.payload, sizeof(message.payload))) {
-        found_dup = true;
-        break;
+        found_dup = true; break;
       }
       idx_hash = (idx_hash + 1) % kMaxDecoded;
     }
-    if (found_dup) continue;
-    if (!found_empty) continue; // table full; drop extras
+    if (found_dup || !found_empty) continue;
 
-    // store unique
     memcpy(&decoded[idx_hash], &message, sizeof(message));
     decoded_hashtable[idx_hash] = &decoded[idx_hash];
     ++num_decoded;
 
-    // --- decode to human text using ftx_message_decode ONLY ---
+    // decode to human text
     char text[FTX_MAX_MESSAGE_LENGTH] = {0};
     ftx_message_offsets_t offsets;
     ftx_message_rc_t urc = ftx_message_decode(&message, &hash_if, text, &offsets);
-    if (urc != FTX_MESSAGE_RC_OK || text[0] == '\0') {
-      continue;
-    }
+    if (urc != FTX_MESSAGE_RC_OK || text[0] == '\0') continue;
 
-    // freq/time/SNR like your current code
+    // freq / time / SNR
     float freq_hz = (mon->min_bin + candidates[i].freq_offset +
                     candidates[i].freq_sub / (float)cfg->freq_osr) / mon->symbol_period;
     float time_s = (candidates[i].time_offset +
@@ -2632,134 +2655,91 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 
     float cand_db = noise_db;
     {
-      // Canonical waterfall indexing:
-      // [time_block][time_sub][freq_sub][freq_bin]
-      // Clamp time to valid range (1A) to avoid fallback-to-noise zero SNR on edge candidates.
       int t_index = candidates[i].time_offset * mon->wf.time_osr + candidates[i].time_sub;
       const int t_count = mon->wf.num_blocks * mon->wf.time_osr;
-      if (t_count > 0) {
-        if (t_index < 0) t_index = 0;
-        if (t_index >= t_count) t_index = t_count - 1;
-      } else {
-        t_index = 0;
-      }
+      if (t_count > 0) { if (t_index < 0) t_index = 0; if (t_index >= t_count) t_index = t_count - 1; }
+      else t_index = 0;
 
       int f_index = candidates[i].freq_sub * mon->wf.num_bins + candidates[i].freq_offset;
       const int f_count = mon->wf.freq_osr * mon->wf.num_bins;
-      if (f_count > 0) {
-        if (f_index < 0) f_index = 0;
-        if (f_index >= f_count) f_index = f_count - 1;
-      } else {
-        f_index = 0;
-      }
+      if (f_count > 0) { if (f_index < 0) f_index = 0; if (f_index >= f_count) f_index = f_count - 1; }
+      else f_index = 0;
 
       size_t offset2 = (size_t)t_index * (size_t)f_count + (size_t)f_index;
       size_t total2 = (size_t)mon->wf.num_blocks * (size_t)mon->wf.block_stride;
-      if (mon->wf.mag && offset2 < total2) {
-        int scaled = mon->wf.mag[offset2];
-        cand_db = 0.5f * ((float)scaled - 240.0f);
-      }
+      if (mon->wf.mag && offset2 < total2) cand_db = 0.5f * ((float)mon->wf.mag[offset2] - 240.0f);
     }
-    
-    //float snr_db = (cand_db - noise_db) + snr_to_2500;
-    float snr_db = (cand_db - noise_db);
 
-    int snr_q = (int)lrintf(snr_db);
+    int snr_q = (int)lrintf(cand_db - noise_db);
     if (snr_q < -30) snr_q = -30;
     if (snr_q >  99) snr_q = 99;
 
-    ESP_LOGI(TAG, "Decoded[%d] t=%.2fs f=%.1fHz snr=%d : %s",
-             decodedCount, time_s, freq_hz, snr_q, text);
-
-    // UI de-dupe by displayed text (keep highest SNR)
-    std::string raw_text_str(text);
-    std::string text_str = raw_text_str;
-    if (rewrite_dxpedition_for_mycall(raw_text_str, mycall_up, text_str)) {
-      ESP_LOGI(TAG, "DXpedition raw match: %s", raw_text_str.c_str());
+    // DXpedition rewrite (uses heap briefly via std::string — bounded, rare path)
+    char final_text[DEC_TEXT_MAX];
+    {
+      std::string raw(text);
+      std::string rewritten(text);
+      if (rewrite_dxpedition_for_mycall(raw, mycall_up, rewritten)) {
+        ESP_LOGI(TAG, "DXpedition raw match: %s", text);
+      }
+      strncpy(final_text, rewritten.c_str(), DEC_TEXT_MAX - 1);
+      final_text[DEC_TEXT_MAX - 1] = '\0';
     }
-    auto it = seen_idx.find(text_str);
-    if (it != seen_idx.end()) {
-      int idx_ui = it->second;
-      if (snr_q > ui_lines[idx_ui].snr) {
-        ui_lines[idx_ui].snr = snr_q;
-        ui_lines[idx_ui].offset_hz = (int)lrintf(freq_hz);
-        ui_lines[idx_ui].slot_id = slot_id;
-        // keep original text, but refresh parsed fields based on it
-        fill_fields_from_text(ui_lines[idx_ui]);
+
+    // UI text dedup (linear scan — 32 entries max, no hash map needed)
+    int dup_idx = -1;
+    for (int j = 0; j < s_dec_count; ++j) {
+      if (strcmp(s_dec[j].text, final_text) == 0) { dup_idx = j; break; }
+    }
+    if (dup_idx >= 0) {
+      if (snr_q > s_dec[dup_idx].snr) {
+        s_dec[dup_idx].snr = snr_q;
+        s_dec[dup_idx].offset_hz = (int)lrintf(freq_hz);
+        s_dec[dup_idx].slot_id = slot_id;
       }
       continue;
     }
 
-    UiRxLine line;
-    line.text = text_str;
-    line.snr = snr_q;
-    line.offset_hz = (int)lrintf(freq_hz);
-    line.slot_id = slot_id;
+    ESP_LOGI(TAG, "Decoded[%d] t=%.2fs f=%.1fHz snr=%d : %s",
+             s_dec_count, time_s, freq_hz, snr_q, final_text);
 
-    time_offsets.push_back(time_s);
+    // Fill static entry
+    DecodeMsg* d = &s_dec[s_dec_count];
+    strncpy(d->text, final_text, DEC_TEXT_MAX - 1); d->text[DEC_TEXT_MAX - 1] = '\0';
+    d->snr = snr_q;
+    d->offset_hz = (int)lrintf(freq_hz);
+    d->slot_id = slot_id;
+    d->time_s = time_s;
 
-    fill_fields_from_text(line);
+    dec_fill_fields(d);
 
-    // CQ detection (now works because text contains CQ again)
-    if (line.text.rfind("CQ ", 0) == 0 || line.text == "CQ") line.is_cq = true;
+    d->is_cq = (strncmp(d->text, "CQ ", 3) == 0 || strcmp(d->text, "CQ") == 0);
 
-    // to-me detection (same behavior as your old code)
-    //std::string f1_up = to_upper(line.field1);
-    std::string f1_up = normalize_call_token(line.field1);
-    if (!mycall_up.empty() && f1_up == mycall_up) line.is_to_me = true;
+    char f1_norm[DEC_FIELD_MAX];
+    dec_normalize_call(d->field1, f1_norm, DEC_FIELD_MAX);
+    d->is_to_me = (mycall_up[0] != '\0' && strcmp(f1_norm, mycall_up) == 0);
 
-    ui_lines.push_back(line);
-    seen_idx[text_str] = (int)ui_lines.size() - 1;
+    log_rxtx_line('R', snr_q, (int)lrintf(freq_hz), std::string(final_text), -1);
 
-    log_rxtx_line('R', snr_q, (int)lrintf(freq_hz), text_str, -1);
-
-    decodedCount++;
-    if (decodedCount >= 32) break;
+    s_dec_count++;
   }
 
-  // ==== HEAP STRESS INJECTION: pad to 32 fake CQ messages ====
-  {
-    static const char* fake_calls[] = {
-      "W1AW", "K2XX", "N3LLO", "W4EEE", "K5ZZZ", "N6BBB", "W7CCC",
-      "K8DDD", "N9FFF", "W0GGG", "VE3ABC", "VK2DEF", "JA1GHI",
-      "G3JKL", "DL5MNO", "F6PQR", "EA7STU", "I8VWX", "OH9YZZ",
-      "ZL2AAA", "PY1BBB", "LU3CCC", "CE4DDD", "HL5EEE", "HS7FFF",
-      "9A1GGG", "YU2HHH", "OK3III", "SP4JJJ", "UA6KKK", "SV9LLL",
-      "OZ5MMM"
-    };
-    int fake_idx = 0;
-    while (decodedCount < 32 && fake_idx < 32) {
-      char fake_text[64];
-      snprintf(fake_text, sizeof(fake_text), "CQ %s AB%02d",
-               fake_calls[fake_idx], fake_idx);
-      UiRxLine line;
-      line.text = fake_text;
-      line.snr = -10 + (fake_idx % 20);
-      line.offset_hz = 500 + fake_idx * 75;
-      line.slot_id = slot_id;
-      fill_fields_from_text(line);
-      line.is_cq = true;
-      ui_lines.push_back(line);
-      seen_idx[line.text] = (int)ui_lines.size() - 1;
-      log_rxtx_line('R', line.snr, line.offset_hz, line.text, -1);
-      decodedCount++;
-      fake_idx++;
+  ESP_LOGI(TAG, "Decoded %d unique messages", s_dec_count);
+
+  // ---- Auto sync RTC ----
+  if (s_dec_count > 3) {
+    // Simple insertion sort to find median of time_s values
+    float sorted_t[DEC_MAX];
+    int nt = 0;
+    for (int i = 0; i < s_dec_count; ++i) sorted_t[nt++] = s_dec[i].time_s;
+    for (int i = 1; i < nt; ++i) {
+      float key = sorted_t[i];
+      int j = i - 1;
+      while (j >= 0 && sorted_t[j] > key) { sorted_t[j + 1] = sorted_t[j]; --j; }
+      sorted_t[j + 1] = key;
     }
-    ESP_LOGW(TAG, "HEAP_STRESS: injected %d fake CQs, total decoded=%d",
-             fake_idx, decodedCount);
-  }
-  // ==== END INJECTION ====
-
-  if (decodedCount == 0) {
-    ESP_LOGW(TAG, "Candidates present but no messages decoded");
-  }
-
-  // ---- Auto sync RTC (your existing logic) ----
-  if (time_offsets.size() > 3) {
-    std::vector<float> tmp = time_offsets;
-    std::sort(tmp.begin(), tmp.end());
-    float median = tmp[tmp.size() / 2];
-    if (std::fabs(median) > 0.3f) {
+    float median = sorted_t[nt / 2];
+    if (fabsf(median) > 0.3f) {
       int delta_ms = (int)lrintf(-median * 1000.0f);
       if (delta_ms > 320) delta_ms = 320;
       if (delta_ms < -320) delta_ms = -320;
@@ -2768,38 +2748,34 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       rtc_update_strings();
       rtc_sync_to_hw();
       ESP_LOGI("SYNC", "Applied RTC sync: median=%.2fs delta=%dms", median, delta_ms);
-    } else {
-      ESP_LOGD("SYNC", "Median=%.2fs within threshold; no sync", median);
     }
   }
 
-  // ---- group: to-me, CQ, other ----
-  std::vector<UiRxLine> to_me, cqs, others;
-  std::string mycall = to_upper(g_call);
-  for (auto& l : ui_lines) {
-    //std::string f1 = to_upper(l.field1);
-    std::string f1 = normalize_call_token(l.field1);
-    if (!mycall.empty() && !f1.empty() && f1 == mycall) {
-      l.is_to_me = true;
-      to_me.push_back(l);
-    } else if (l.is_cq) {
-      cqs.push_back(l);
-    } else {
-      others.push_back(l);
-    }
-  }
+  // ---- Sort in-place: to_me first, CQ second, others last ----
+  qsort(s_dec, s_dec_count, sizeof(DecodeMsg), dec_sort_cmp);
 
-  // ---- autoseq trigger logic (unchanged idea) ----
+  // ---- Autoseq: build small to_me vector at boundary (only to_me entries) ----
   if (!g_was_txing) {
     std::vector<UiRxLine> to_me_auto;
-    to_me_auto.reserve(to_me.size());
-    for (const auto& msg : to_me) {
-      const std::string dxcall_norm = normalize_call_token(msg.field2);
-      if (ignorelist_matches_normalized_dxcall(dxcall_norm)) {
-        ESP_LOGI(TAG, "IgnoreList: skip auto reply to %s", dxcall_norm.c_str());
+    for (int i = 0; i < s_dec_count; ++i) {
+      if (!s_dec[i].is_to_me) break;  // sorted, so once we pass to_me we're done
+      char dxnorm[DEC_FIELD_MAX];
+      dec_normalize_call(s_dec[i].field2, dxnorm, DEC_FIELD_MAX);
+      if (ignorelist_matches_normalized_dxcall(std::string(dxnorm))) {
+        ESP_LOGI(TAG, "IgnoreList: skip auto reply to %s", dxnorm);
         continue;
       }
-      to_me_auto.push_back(msg);
+      UiRxLine rx;
+      rx.text = s_dec[i].text;
+      rx.field1 = s_dec[i].field1;
+      rx.field2 = s_dec[i].field2;
+      rx.field3 = s_dec[i].field3;
+      rx.snr = s_dec[i].snr;
+      rx.offset_hz = s_dec[i].offset_hz;
+      rx.slot_id = s_dec[i].slot_id;
+      rx.is_cq = s_dec[i].is_cq;
+      rx.is_to_me = true;
+      to_me_auto.push_back(std::move(rx));
     }
 
     if (!to_me_auto.empty()) {
@@ -2827,13 +2803,22 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     }
   }
 
-  std::vector<UiRxLine> merged;
-  merged.reserve(to_me.size() + cqs.size() + others.size());
-  merged.insert(merged.end(), to_me.begin(), to_me.end());
-  merged.insert(merged.end(), cqs.begin(), cqs.end());
-  merged.insert(merged.end(), others.begin(), others.end());
-
-  g_rx_lines = merged;
+  // ---- Single pass: static array → g_rx_lines (one heap allocation) ----
+  g_rx_lines.clear();
+  g_rx_lines.reserve(s_dec_count);
+  for (int i = 0; i < s_dec_count; ++i) {
+    UiRxLine rx;
+    rx.text      = s_dec[i].text;
+    rx.field1    = s_dec[i].field1;
+    rx.field2    = s_dec[i].field2;
+    rx.field3    = s_dec[i].field3;
+    rx.snr       = s_dec[i].snr;
+    rx.offset_hz = s_dec[i].offset_hz;
+    rx.slot_id   = s_dec[i].slot_id;
+    rx.is_cq     = s_dec[i].is_cq;
+    rx.is_to_me  = s_dec[i].is_to_me;
+    g_rx_lines.push_back(std::move(rx));
+  }
 
   if (update_ui) {
     ui_set_rx_list(g_rx_lines);
@@ -2845,26 +2830,19 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     g_rx_dirty = true;
   }
 
-#ifdef DEBUG_LOG
-    //char buf[32];
-    //snprintf(buf, sizeof(buf), "HashTableSize %d", callsign_hashtable_size);
-    //debug_log_line_public(buf);
-#endif
-
-  // ==== HEAP STRESS INSTRUMENTATION (exit) ====
+  // ---- heap instrumentation (exit) ----
   {
-    size_t heap_exit  = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    size_t heap_exit = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     size_t heap_exit_largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    size_t heap_exit_min = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
     UBaseType_t stack_hw_exit = uxTaskGetStackHighWaterMark(NULL);
     ESP_LOGW(TAG, "DECODE_HEAP EXIT: free=%u largest=%u alltime_min=%u stack_hw=%u (delta_free=%d)",
              (unsigned)heap_exit, (unsigned)heap_exit_largest,
-             (unsigned)heap_exit_min, (unsigned)stack_hw_exit,
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
+             (unsigned)stack_hw_exit,
              (int)heap_exit - (int)heap_entry);
   }
-  // ==== END INSTRUMENTATION ====
 
-  g_decode_in_progress = false;  // Allow TX trigger now that decode is complete
+  g_decode_in_progress = false;
 }
 
 static void draw_menu_long_edit() {
