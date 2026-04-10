@@ -9,9 +9,7 @@
 
 // Maximum nfft for static buffer sizing.
 // FT8 at 6kHz, freq_osr=1: nfft = 6000 * 0.160 * 1 = 960
-// FT8 at 12kHz, freq_osr=1: nfft = 12000 * 0.160 * 1 = 1920
-// Set to 1920 to cover both configurations.
-#define MONITOR_NFFT_MAX 1920
+#define MONITOR_NFFT_MAX 960
 
 static float* window_buf = NULL;
 static float* last_frame_buf = NULL;
