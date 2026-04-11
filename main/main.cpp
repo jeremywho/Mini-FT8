@@ -59,8 +59,6 @@ static const char* STATION_FILE = "/spiffs/Station.ini";
 static sdmmc_card_t* g_sd_card = NULL;
 static bool g_sd_mounted = false;
 static bool g_ble_enabled = true;
-static bool g_ble_qso_pick_mode = false;
-static bool g_ble_dump_in_progress = false;
 
 #define ENABLE_BLE 1
 
@@ -104,15 +102,12 @@ static QueueHandle_t ble_cmd_queue = nullptr;
 static uint16_t gatt_tx_handle = 0;
 static uint16_t g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static bool g_ble_synced = false;
-static bool g_ble_stack_active = false;
-static bool g_ble_nvs_ready = false;
 static bool g_ble_force_send = false;
 static std::string g_ble_adv_name;
 static std::string g_ble_last_payload;
 static int64_t g_ble_last_tick_slot = -1;
 static int g_ble_last_tick_sec = -1;
 static bool g_ble_text_mode = false;
-static uint8_t g_own_addr_type = 0;
 static const char* BT_TAG = "BLE_INIT";
 
 enum class BleDumpTxMode : uint8_t {
@@ -149,11 +144,6 @@ static void nimble_host_task(void *param);
 static void ble_on_sync(void);
 static void ble_app_advertise(void);
 static void ble_update_name_from_station(bool restart_adv);
-static bool ble_stack_start(void);
-static bool ble_stack_stop(void);
-static bool ble_ensure_nvs_ready(void);
-static void ble_reset_runtime_state(void);
-static void ble_delete_cmd_queue(void);
 static void ble_countdown_tick();
 static int ble_send_payload_raw(const std::string& payload, bool indicate);
 static bool ble_wait_for_indicate_ack(int timeout_ms);
@@ -288,61 +278,24 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
 };
 
 
-static void ble_delete_cmd_queue(void) {
-    if (!ble_cmd_queue) return;
-    vQueueDelete(ble_cmd_queue);
-    ble_cmd_queue = nullptr;
-}
-
-static void ble_reset_runtime_state(void) {
-    gatt_tx_handle = 0;
-    g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-    g_ble_synced = false;
-    g_ble_force_send = false;
-    g_ble_last_payload.clear();
-    g_ble_last_tick_slot = -1;
-    g_ble_last_tick_sec = -1;
-    g_ble_text_mode = false;
-    g_ble_qso_pick_mode = false;
-    g_ble_dump_in_progress = false;
-    g_own_addr_type = 0;
-    g_ble_tx_notify_enabled = false;
-    g_ble_tx_indicate_enabled = false;
-    g_ble_indicate_waiting = false;
-    g_ble_indicate_status = 0;
-    g_ble_att_mtu = 23;
-    g_ble_dump_xfer = BleDumpTransferState{};
-}
-
-static bool ble_ensure_nvs_ready(void) {
-    if (g_ble_nvs_ready) return true;
+static void init_bluetooth(void)
+{
+    static bool inited = false;
+    if (inited) return;
+    inited = true;
+    ESP_LOGI(BT_TAG, "init_bluetooth start");
 
     esp_err_t nvrc = nvs_flash_init();
     if (nvrc == ESP_ERR_NVS_NO_FREE_PAGES || nvrc == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         nvrc = nvs_flash_init();
     }
-    if (nvrc != ESP_OK) {
-        ESP_LOGE(BT_TAG, "nvs_flash_init failed: %s", esp_err_to_name(nvrc));
-        return false;
-    }
-    g_ble_nvs_ready = true;
-    return true;
-}
-
-static bool ble_stack_start(void) {
-    if (g_ble_stack_active) return true;
-    ESP_LOGI(BT_TAG, "BLE stack start");
-
-    if (!ble_ensure_nvs_ready()) return false;
-
-    ble_delete_cmd_queue();
-    ble_reset_runtime_state();
+    ESP_ERROR_CHECK(nvrc);
 
     int rc = nimble_port_init();
     if (rc != 0) {
         ESP_LOGE(BT_TAG, "nimble_port_init failed: %d", rc);
-        return false;
+        return;
     }
     ESP_LOGI(BT_TAG, "nimble_port_init OK");
 
@@ -350,80 +303,26 @@ static bool ble_stack_start(void) {
     ble_svc_gatt_init();
     ESP_LOGI(BT_TAG, "GAP/GATT init done");
 
-    g_ble_stack_active = true;
     ble_cmd_queue = xQueueCreate(32, sizeof(BleUiInput));
-    if (!ble_cmd_queue) {
-        ESP_LOGE(BT_TAG, "xQueueCreate failed");
-        g_ble_stack_active = false;
-        nimble_port_deinit();
-        return false;
-    }
+    assert(ble_cmd_queue);
     ble_update_name_from_station(false);
 
     rc = ble_gatts_count_cfg(gatt_svcs);
     if (rc != 0) {
         ESP_LOGE(BT_TAG, "ble_gatts_count_cfg failed: %d", rc);
-        ble_delete_cmd_queue();
-        g_ble_stack_active = false;
-        nimble_port_deinit();
-        return false;
+        return;
     }
     rc = ble_gatts_add_svcs(gatt_svcs);
     if (rc != 0) {
         ESP_LOGE(BT_TAG, "ble_gatts_add_svcs failed: %d", rc);
-        ble_delete_cmd_queue();
-        g_ble_stack_active = false;
-        nimble_port_deinit();
-        return false;
+        return;
     }
     ESP_LOGI(BT_TAG, "Services added");
 
     ble_hs_cfg.sync_cb = ble_on_sync;
+
     nimble_port_freertos_init(nimble_host_task);
-    g_ble_force_send = true;
     ESP_LOGI(BT_TAG, "Host task started");
-    return true;
-}
-
-static bool ble_stack_stop(void) {
-    if (!g_ble_stack_active) {
-        ble_delete_cmd_queue();
-        ble_reset_runtime_state();
-        return true;
-    }
-
-    ESP_LOGI(BT_TAG, "BLE stack stop");
-
-    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-        int rc = ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        if (rc != 0) {
-            ESP_LOGW(BT_TAG, "ble_gap_terminate rc=%d", rc);
-        }
-    }
-    if (g_ble_synced) {
-        int rc = ble_gap_adv_stop();
-        if (rc != 0) {
-            ESP_LOGW(BT_TAG, "ble_gap_adv_stop rc=%d", rc);
-        }
-    }
-
-    int rc = nimble_port_stop();
-    if (rc != 0) {
-        ESP_LOGE(BT_TAG, "nimble_port_stop failed: %d", rc);
-        return false;
-    }
-
-    esp_err_t deinit_rc = nimble_port_deinit();
-    if (deinit_rc != ESP_OK) {
-        ESP_LOGE(BT_TAG, "nimble_port_deinit failed: %s", esp_err_to_name(deinit_rc));
-        return false;
-    }
-
-    ble_delete_cmd_queue();
-    ble_reset_runtime_state();
-    g_ble_stack_active = false;
-    ESP_LOGI(BT_TAG, "BLE stack stopped");
-    return true;
 }
 
 static int gap_cb(struct ble_gap_event *event, void *arg)
@@ -998,6 +897,8 @@ static constexpr uint32_t APP_CORE0_STACK_BYTES = 12288; // Tune to 16384/18432 
 static TickType_t g_app_core0_stack_last_sample_tick = 0;
 static uint32_t g_app_core0_stack_cur_free_bytes = 0;
 static uint32_t g_app_core0_stack_min_free_bytes = 0;
+static bool g_ble_qso_pick_mode = false;
+static bool g_ble_dump_in_progress = false;
 static UIMode g_ble_qso_return_mode = UIMode::RX;
 
 static void host_handle_line(const std::string& line);
@@ -1184,6 +1085,9 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 static void update_countdown();
 static void menu_flash_tick();
 static void rx_flash_tick();
+#if ENABLE_BLE
+static uint8_t g_own_addr_type;
+#endif
 static bool looks_like_grid(const std::string& s);
 static bool looks_like_report(const std::string& s, int& out);
 static std::string g_last_reply_text;
@@ -2008,38 +1912,10 @@ static std::string clamp_ignore_prefix_text(const std::string& s) {
   return s.substr(0, kIgnorePrefixTextMaxLen);
 }
 
-static std::string normalize_time_hms(const std::string& src) {
-  int h = 0, m = 0, s = 0;
-  if (sscanf(src.c_str(), "%d:%d:%d", &h, &m, &s) == 3) {
-    if (h >= 0 && h <= 23 && m >= 0 && m <= 59 && s >= 0 && s <= 59) {
-      char out[16];
-      snprintf(out, sizeof(out), "%02d:%02d:%02d", h, m, s);
-      return out;
-    }
-  }
-
-  std::string digits;
-  digits.reserve(src.size());
-  for (unsigned char ch : src) {
-    if (std::isdigit(ch)) digits.push_back((char)ch);
-  }
-  if (digits.size() >= 6) {
-    h = (digits[0] - '0') * 10 + (digits[1] - '0');
-    m = (digits[2] - '0') * 10 + (digits[3] - '0');
-    s = (digits[4] - '0') * 10 + (digits[5] - '0');
-    if (h >= 0 && h <= 23 && m >= 0 && m <= 59 && s >= 0 && s <= 59) {
-      char out[16];
-      snprintf(out, sizeof(out), "%02d:%02d:%02d", h, m, s);
-      return out;
-    }
-  }
-  return src;
-}
-
 static std::string menu_sleep_batt_line() {
   int level = (int)M5.Power.getBatteryLevel();
   if (level < 0 || level > 100) level = 0;
-  char buf[40];
+  char buf[32];
   snprintf(buf, sizeof(buf), "Sleep/Batt %d%%", level);
   return buf;
 }
@@ -3233,7 +3109,6 @@ static int page_count(int items, int page_size) {
 }
 
 static int ble_send_payload_raw(const std::string& payload, bool indicate) {
-  if (!g_ble_stack_active) return BLE_HS_EINVAL;
   if (!g_ble_enabled) return BLE_HS_EINVAL;
   if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return BLE_HS_ENOTCONN;
   if (!gatt_tx_handle) return BLE_HS_EINVAL;
@@ -3342,25 +3217,26 @@ static void apply_ble_enabled_policy(bool runtime_apply) {
   if (!runtime_apply) return;
 
   if (!g_ble_enabled) {
-    if (!ble_stack_stop()) {
-      ESP_LOGE(BT_TAG, "BLE OFF rejected: stop failed");
-      g_ble_enabled = true;
+    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+      ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
+    if (g_ble_synced) {
+      ble_gap_adv_stop();
+    }
+    g_ble_last_payload.clear();
+    g_ble_last_tick_slot = -1;
+    g_ble_last_tick_sec = -1;
+    g_ble_text_mode = false;
+    g_ble_qso_pick_mode = false;
+    g_ble_dump_in_progress = false;
+    if (ble_cmd_queue) xQueueReset(ble_cmd_queue);
     return;
-  }
-
-  if (!g_ble_stack_active) {
-    if (!ble_stack_start()) {
-      ESP_LOGE(BT_TAG, "BLE ON rejected: start failed");
-      g_ble_enabled = false;
-      return;
-    }
   }
 
   g_ble_force_send = true;
   g_ble_last_tick_slot = -1;
   g_ble_last_tick_sec = -1;
-  if (g_ble_stack_active && g_ble_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+  if (g_ble_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
     ble_app_advertise();
   }
 }
@@ -3397,14 +3273,11 @@ static void ble_update_name_from_station(bool restart_adv) {
   if (desired.size() > 24) desired.resize(24);
   if (desired.empty()) desired = "Mini-FT8";
 
+  if (desired == g_ble_adv_name) return;
   g_ble_adv_name = desired;
-  if (!g_ble_stack_active) return;
-  int rc = ble_svc_gap_device_name_set(g_ble_adv_name.c_str());
-  if (rc != 0) {
-    ESP_LOGW(BT_TAG, "ble_svc_gap_device_name_set rc=%d", rc);
-  }
+  ble_svc_gap_device_name_set(g_ble_adv_name.c_str());
 
-  if (restart_adv && g_ble_stack_active && g_ble_enabled && g_ble_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+  if (restart_adv && g_ble_enabled && g_ble_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
     ble_app_advertise();
   }
 }
@@ -3702,7 +3575,6 @@ static void nimble_host_task(void* param) {
 }
 
 static void ble_app_advertise(void) {
-  if (!g_ble_stack_active) return;
   if (!g_ble_enabled) return;
   if (!g_ble_synced) return;
   if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) return;
@@ -3742,6 +3614,7 @@ static void apply_ble_enabled_policy(bool runtime_apply) {
 }
 static void ble_mirror_tick() {}
 static void ble_countdown_tick() {}
+static void init_bluetooth(void) {}
 #endif // ENABLE_BLE
 
 static std::string trim_copy(const std::string& s) {
@@ -4138,7 +4011,7 @@ static void load_station_data() {
     } else if (sscanf(line, "date=%63s", line) == 1) {
       g_date = line;
     } else if (sscanf(line, "time=%63s", line) == 1) {
-      g_time = normalize_time_hms(line);
+      g_time = line;
     } else if (sscanf(line, "cq_type=%d", &val) == 1) {
       if (val >= 0 && val <= 5) g_cq_type = (CqType)val;
     } else if (sscanf(line, "offset_src=%d", &val) == 1) {
@@ -4436,7 +4309,7 @@ static void ble_commit_text_input(const BleUiInput& input) {
     if (value.size() > max_len) value.resize(max_len);
     status_edit_buffer = value;
     if (status_edit_idx == 4) g_date = status_edit_buffer;
-    else g_time = normalize_time_hms(status_edit_buffer);
+    else g_time = status_edit_buffer;
     save_station_data();
     rtc_set_from_strings();
     rtc_sync_to_hw();  // Persist to hardware RTC
@@ -4480,6 +4353,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
   ui_mode = UIMode::RX;
   load_station_data();
+  init_bluetooth();
   apply_ble_enabled_policy(true);
   apply_radio_profile_binding();
   update_autoseq_cq_type();
@@ -5016,7 +4890,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   draw_status_view();
                 } else if (c == '\n') {
                   if (status_edit_idx == 4) g_date = status_edit_buffer;
-                  else g_time = normalize_time_hms(status_edit_buffer);
+                  else g_time = status_edit_buffer;
                   save_station_data();
                   rtc_set_from_strings();
                   rtc_sync_to_hw();  // Persist to hardware RTC
