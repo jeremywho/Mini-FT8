@@ -38,6 +38,7 @@ extern "C" {
 #include <memory>
 #include "driver/usb_serial_jtag.h"
 #include "hal/uart_ll.h"
+#include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_system.h"
 #include "esp_random.h"
@@ -4423,8 +4424,26 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     debug_update_app_core0_stack_hud(false);
   }
 
-  // Key injection queue for UART0 RX testing
+  // Key injection queue for console UART RX (G15)
   s_key_inject_queue = xQueueCreate(32, sizeof(char));
+
+  // sdkconfig puts the ESP console on UART0 peripheral with TX=G13,
+  // but IDF's custom-console init only guarantees the TX pin routing —
+  // it doesn't always hook up RX. Explicitly route G15 to UART0 RXD.
+  // This is a no-op if already set, and doesn't install a driver.
+  uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, GPIO_NUM_15,
+               UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+  // Drain any stale bytes left in the FIFO from ROM-bootloader time
+  // (when UART0 RX was still on its IO_MUX default pin, likely floating).
+  {
+    uart_dev_t *hw = UART_LL_GET_HW(0);
+    uint8_t scratch[64];
+    while (uart_ll_get_rxfifo_len(hw) > 0) {
+      uint32_t n = uart_ll_get_rxfifo_len(hw);
+      if (n > 64) n = 64;
+      uart_ll_read_rxfifo(hw, scratch, n);
+    }
+  }
 
   // UI loop
   char last_key = 0;
