@@ -155,3 +155,68 @@ The reincarnation problem disappears because:
 - Mid-QSO messages from unknown DX are rejected (no memory-less reincarnation)
 - The only new contexts created are for TX1 (fresh QSO starts) where default
   metadata is correct
+
+## Invariant: Active entries always have a valid next_tx
+
+The autoseq engine maintains this invariant for every active queue entry:
+
+> **If `ctx` is in the active zone and `state != IDLE`, then `next_tx != TX_UNDEF`.**
+
+This invariant is what lets `autoseq_fetch_pending_tx()` safely return the TX
+at `s_queue[0]` without checking for degenerate states. Violating it causes a
+hard deadlock: `fetch_pending_tx` returns false, no TX fires, `tick()` never
+runs to advance the state, and the dead entry blocks every subsequent TX —
+including beacon CQs sorted behind it.
+
+### How the invariant was maintained (pre-inactive-queue)
+
+1. `set_state()` is the only legitimate way to change `state`, and it always
+   writes `next_tx` at the same time.
+2. The override path in `generate_response()` sets `next_tx = TX_UNDEF` as a
+   "clean slate" but is always immediately followed by a state machine
+   transition that restores a valid `next_tx`.
+3. `autoseq_tick()` refreshes `next_tx` idempotently based on `state` on every
+   call (within retry limit).
+4. For an existing active ctx passed to `generate_response(override=false)`,
+   the invariant holds by induction: if the state machine transitions, the new
+   `set_state` maintains it; if it falls to `default`, `next_tx` was already
+   valid from the prior tick or transition.
+
+### How the inactive queue almost broke it
+
+`move_to_inactive()` clobbers `next_tx = TX_UNDEF` before parking an entry.
+When DX retries and `on_decode()` reactivates the dormant context, the
+reactivated entry lands in the active zone with `next_tx == TX_UNDEF`.
+`generate_response(override=false)` then runs the state machine; if the
+(state, rcvd) combination falls to `default: return false`, `next_tx` is
+*never* restored. The active zone now contains an entry violating the
+invariant, and the queue deadlocks.
+
+### Fix: make `generate_response` locally total
+
+Every state handler in `generate_response()` must explicitly handle every
+possible `rcvd` type — there is no implicit `default` that silently leaves
+`next_tx` stale. For `(state, rcvd)` combinations that don't advance the QSO,
+the handler refreshes `next_tx` to the state's canonical value and returns
+false. The canonical mapping:
+
+| State | Canonical next_tx | Meaning |
+|---|---|---|
+| CALLING | TX6 | Send CQ |
+| REPLYING | TX1 | Send our grid |
+| REPORT | TX2 | Send our report |
+| ROGER_REPORT | TX3 | Send R+report |
+| ROGERS | TX4 | Send RR73 |
+| SIGNOFF | TX5 | Send 73 |
+
+The semantics of every "no-op" case is identical: **"DX sent something that
+doesn't advance our state — they probably didn't decode our last message.
+Keep sending what matches our current state."** Encoding this in the
+switch/case (rather than a centralized fallback) makes every state handler
+self-contained and locally reasonable — when you read the REPORT case, you
+see exactly what happens for every possible input, including the ones that
+don't advance the QSO.
+
+The invariant is restored even across the inactive queue boundary: if
+`reactivate()` brings back an entry with stale `next_tx`, the very next call
+to `generate_response()` repairs it unconditionally.
