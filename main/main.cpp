@@ -1600,10 +1600,11 @@ static bool uart_inject_last_was_cr = false;
 static void poll_uart_inject_keys() {
   if (!s_key_inject_queue) return;
   // Read directly from the console UART FIFO — no driver needed.
-  // sdkconfig configures ESP console on UART1 TX=GPIO13, RX=GPIO15.
-  // We read the same UART1 RX FIFO here so one UART-to-USB adapter
-  // wired to G13/G15 serves both ESP_LOG output and key injection.
-  uart_dev_t *hw = UART_LL_GET_HW(1);
+  // sdkconfig configures ESP console on UART0 peripheral with custom
+  // pins TX=GPIO13, RX=GPIO15 (see CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0
+  // and CONFIG_ESP_CONSOLE_UART_TX_GPIO / _RX_GPIO). KH1 CAT uses
+  // UART1 peripheral on GPIO1 — no conflict.
+  uart_dev_t *hw = UART_LL_GET_HW(0);
   while (true) {
     uint32_t avail = uart_ll_get_rxfifo_len(hw);
     if (avail == 0) break;
