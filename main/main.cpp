@@ -2717,36 +2717,6 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     s_dec_count++;
   }
 
-  // ==== BUSY-RX STRESS INJECTION: pad to 32 fake CQ messages ====
-  // Reproduces busy band conditions to test UAC/decode stability.
-  {
-    static const char* fake_calls[] = {
-      "W1AW", "K2XX", "N3LLO", "W4EEE", "K5ZZZ", "N6BBB", "W7CCC",
-      "K8DDD", "N9FFF", "W0GGG", "VE3ABC", "VK2DEF", "JA1GHI",
-      "G3JKL", "DL5MNO", "F6PQR", "EA7STU", "I8VWX", "OH9YZZ",
-      "ZL2AAA", "PY1BBB", "LU3CCC", "CE4DDD", "HL5EEE", "HS7FFF",
-      "9A1GGG", "YU2HHH", "OK3III", "SP4JJJ", "UA6KKK", "SV9LLL",
-      "OZ5MMM"
-    };
-    int injected = 0;
-    while (s_dec_count < DEC_MAX && injected < 32) {
-      DecodeMsg* d = &s_dec[s_dec_count];
-      snprintf(d->text, DEC_TEXT_MAX, "CQ %s AB%02d", fake_calls[injected], injected);
-      d->snr = -10 + (injected % 20);
-      d->offset_hz = 500 + injected * 75;
-      d->slot_id = slot_id;
-      d->time_s = 0.0f;
-      dec_fill_fields(d);
-      d->is_cq = true;
-      d->is_to_me = false;
-      log_rxtx_line('R', d->snr, d->offset_hz, std::string(d->text), -1);
-      s_dec_count++;
-      injected++;
-    }
-    ESP_LOGW(TAG, "BUSY_RX_STRESS: injected %d fake CQs, total=%d", injected, s_dec_count);
-  }
-  // ==== END INJECTION ====
-
   ESP_LOGI(TAG, "Decoded %d unique messages", s_dec_count);
 
   // ---- Auto sync RTC ----
