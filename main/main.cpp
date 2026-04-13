@@ -106,6 +106,10 @@ static bool g_ble_synced = false;
 static bool g_ble_force_send = false;
 static std::string g_ble_adv_name;
 static std::string g_ble_last_payload;
+static std::string g_ble_last_screen_lines[6];
+static std::string g_ble_last_line7;
+static bool g_ble_last_screen_valid = false;
+static int64_t g_ble_status_clock_slot_sent = -1;
 static int64_t g_ble_last_tick_slot = -1;
 static int g_ble_last_tick_sec = -1;
 static bool g_ble_text_mode = false;
@@ -346,6 +350,8 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
               return 0;
             }
             g_ble_force_send = true;
+            g_ble_last_screen_valid = false;
+            g_ble_status_clock_slot_sent = -1;
             g_ble_last_tick_slot = -1;
             g_ble_last_tick_sec = -1;
             g_ble_text_mode = false;
@@ -365,6 +371,9 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         g_ble_last_payload.clear();
+        g_ble_last_screen_valid = false;
+        g_ble_last_line7.clear();
+        g_ble_status_clock_slot_sent = -1;
         g_ble_last_tick_slot = -1;
         g_ble_last_tick_sec = -1;
         g_ble_text_mode = false;
@@ -3472,6 +3481,9 @@ static void apply_ble_enabled_policy(bool runtime_apply) {
       ble_gap_adv_stop();
     }
     g_ble_last_payload.clear();
+    g_ble_last_screen_valid = false;
+    g_ble_last_line7.clear();
+    g_ble_status_clock_slot_sent = -1;
     g_ble_last_tick_slot = -1;
     g_ble_last_tick_sec = -1;
     g_ble_text_mode = false;
@@ -3482,6 +3494,8 @@ static void apply_ble_enabled_policy(bool runtime_apply) {
   }
 
   g_ble_force_send = true;
+  g_ble_last_screen_valid = false;
+  g_ble_status_clock_slot_sent = -1;
   g_ble_last_tick_slot = -1;
   g_ble_last_tick_sec = -1;
   if (g_ble_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
@@ -3734,6 +3748,19 @@ static void ble_try_dump_qso_file_by_key(char key) {
   ble_dump_qso_file(g_q_files[idx]);
 }
 
+static bool ble_status_clock_only_delta(const std::vector<std::string>& lines,
+                                        const std::string& line7) {
+  if (!g_ble_last_screen_valid) return false;
+  if (line7 != g_ble_last_line7) return false;
+  bool changed = false;
+  for (int i = 0; i < 6; ++i) {
+    if (lines[i] == g_ble_last_screen_lines[i]) continue;
+    if (i != 4 && i != 5) return false;  // STATUS line5/6 only (Date/Time)
+    changed = true;
+  }
+  return changed;
+}
+
 static void ble_mirror_tick() {
   if (!g_ble_enabled) return;
   if (g_ble_dump_in_progress) return;
@@ -3745,6 +3772,30 @@ static void ble_mirror_tick() {
 
   const std::string line7 = g_ble_text_mode ? ble_text_mode_line7() : ble_meta_line();
 
+  bool snapshot_changed = g_ble_force_send || !g_ble_last_screen_valid || (line7 != g_ble_last_line7);
+  if (!snapshot_changed) {
+    for (int i = 0; i < 6; ++i) {
+      if (lines[i] != g_ble_last_screen_lines[i]) {
+        snapshot_changed = true;
+        break;
+      }
+    }
+  }
+  if (!snapshot_changed) return;
+
+  int64_t status_slot_idx = -1;
+  if (!g_ble_force_send &&
+      ui_mode == UIMode::STATUS &&
+      !g_ble_text_mode &&
+      ble_status_clock_only_delta(lines, line7)) {
+      int sec = 0;
+      bool even_slot = true;
+      ble_slot_second_now(status_slot_idx, sec, even_slot);
+      if (g_ble_status_clock_slot_sent == status_slot_idx) {
+        return;
+      }
+  }
+
   std::string screen_key;
   screen_key.reserve(256);
   for (int i = 0; i < 6; ++i) {
@@ -3753,24 +3804,37 @@ static void ble_mirror_tick() {
   }
   screen_key += line7;
 
-  if (g_ble_force_send || screen_key != g_ble_last_payload) {
-    g_ble_force_send = false;
-    g_ble_last_payload = screen_key;
-    if (g_ble_last_tick_slot < 0 || g_ble_last_tick_sec < 0) {
-      int64_t slot_idx = 0;
+  g_ble_force_send = false;
+  g_ble_last_payload = screen_key;
+  for (int i = 0; i < 6; ++i) {
+    g_ble_last_screen_lines[i] = lines[i];
+  }
+  g_ble_last_line7 = line7;
+  g_ble_last_screen_valid = true;
+
+  if (ui_mode == UIMode::STATUS && !g_ble_text_mode) {
+    if (status_slot_idx < 0) {
       int sec = 0;
       bool even_slot = true;
-      ble_slot_second_now(slot_idx, sec, even_slot);
-      (void)even_slot;
-      g_ble_last_tick_slot = slot_idx;
-      g_ble_last_tick_sec = sec;
+      ble_slot_second_now(status_slot_idx, sec, even_slot);
     }
-    std::string out;
-    out.reserve(screen_key.size() + 40);
-    out += "\n==========================\n";
-    out += screen_key;
-    ble_notify_payload(out);
+    g_ble_status_clock_slot_sent = status_slot_idx;
   }
+
+  if (g_ble_last_tick_slot < 0 || g_ble_last_tick_sec < 0) {
+    int64_t slot_idx = 0;
+    int sec = 0;
+    bool even_slot = true;
+    ble_slot_second_now(slot_idx, sec, even_slot);
+    g_ble_last_tick_slot = slot_idx;
+    g_ble_last_tick_sec = sec;
+  }
+
+  std::string out;
+  out.reserve(screen_key.size() + 40);
+  out += "\n==========================\n";
+  out += screen_key;
+  ble_notify_payload(out);
 }
 
 static void ble_countdown_tick() {
