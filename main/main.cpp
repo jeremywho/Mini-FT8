@@ -1155,6 +1155,8 @@ static RadioProfileBinding get_radio_profile_binding(RadioType r);
 static void apply_radio_profile_binding();
 static void gps_runtime_tick();
 static std::string expand_comment_macros(const std::string& src);
+static std::string normalize_grid_maidenhead(const std::string& src);
+static std::string grid_ft8_4(const std::string& grid);
 // Single-threaded TX state machine (replaces separate tx_send_task)
 // TX runs in main loop via tx_tick(), one tone at a time
 static bool g_tx_active = false;           // TX state machine is running
@@ -1684,6 +1686,7 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
   snprintf(freq_str, sizeof(freq_str), "%.3f", freq_mhz);
 
   std::string comment_expanded = expand_comment_macros(g_comment1);
+  const std::string my_grid4 = grid_ft8_4(g_grid);
   // Build rst_sent/rst_rcvd fragments — omit when -99 (no data),
   // matching DXFT8 reference behavior (ADIF.c omits when value is 0).
   char rst_sent_buf[32] = "";
@@ -1702,7 +1705,7 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
           date, time_on,
           strlen(freq_str), freq_str,
           g_call.size(), g_call.c_str(),
-          g_grid.size(), g_grid.c_str(),
+          my_grid4.size(), my_grid4.c_str(),
           rst_sent_buf, rst_rcvd_buf,
           comment_expanded.size(), comment_expanded.c_str());
   fclose(f);
@@ -2084,16 +2087,19 @@ static void gps_runtime_tick() {
 
   bool changed = false;
   if (!st.grid_square.empty() && st.grid_square != "    ") {
-    const std::string grid8 = lat_lon_to_maidenhead8(st.latitude, st.longitude);
-    if (!grid8.empty()) {
-      g_grid_gps_display8 = grid8;
-    }
-    g_grid_from_gps = true;
-    if (st.grid_square != g_grid) {
-      g_grid = st.grid_square;
-      autoseq_set_station(g_call, g_grid);
-      changed = true;
-      ESP_LOGI(TAG, "GPS grid synced: %s", g_grid.c_str());
+    const std::string gps_grid = normalize_grid_maidenhead(st.grid_square);
+    if (!gps_grid.empty()) {
+      const std::string grid8 = lat_lon_to_maidenhead8(st.latitude, st.longitude);
+      if (!grid8.empty()) {
+        g_grid_gps_display8 = grid8;
+      }
+      g_grid_from_gps = true;
+      if (gps_grid != g_grid) {
+        g_grid = gps_grid;
+        autoseq_set_station(g_call, grid_ft8_4(g_grid));
+        changed = true;
+        ESP_LOGI(TAG, "GPS grid synced: %s", g_grid.c_str());
+      }
     }
   }
 
@@ -2254,6 +2260,48 @@ static std::string normalize_date_ymd(const std::string& src) {
   }
 
   return "";
+}
+
+static std::string normalize_grid_maidenhead(const std::string& src) {
+  size_t b = 0;
+  size_t e = src.size();
+  while (b < e && std::isspace(static_cast<unsigned char>(src[b]))) ++b;
+  while (e > b && std::isspace(static_cast<unsigned char>(src[e - 1]))) --e;
+
+  const size_t n = e - b;
+  if (n != 4 && n != 6 && n != 8) return "";
+
+  std::string out = src.substr(b, n);
+  auto is_digit_char = [](char ch) { return ch >= '0' && ch <= '9'; };
+  auto to_upper = [](char ch) { return static_cast<char>(std::toupper(static_cast<unsigned char>(ch))); };
+  auto to_lower = [](char ch) { return static_cast<char>(std::tolower(static_cast<unsigned char>(ch))); };
+
+  char c0 = to_upper(out[0]);
+  char c1 = to_upper(out[1]);
+  if (c0 < 'A' || c0 > 'R' || c1 < 'A' || c1 > 'R') return "";
+  if (!is_digit_char(out[2]) || !is_digit_char(out[3])) return "";
+  out[0] = c0;
+  out[1] = c1;
+
+  if (n >= 6) {
+    char c4 = to_upper(out[4]);
+    char c5 = to_upper(out[5]);
+    if (c4 < 'A' || c4 > 'X' || c5 < 'A' || c5 > 'X') return "";
+    out[4] = to_lower(c4);
+    out[5] = to_lower(c5);
+  }
+
+  if (n == 8) {
+    if (!is_digit_char(out[6]) || !is_digit_char(out[7])) return "";
+  }
+
+  return out;
+}
+
+static std::string grid_ft8_4(const std::string& grid) {
+  const std::string norm = normalize_grid_maidenhead(grid);
+  if (norm.size() >= 4) return norm.substr(0, 4);
+  return "CM97";
 }
 
 static std::string menu_sleep_batt_line() {
@@ -4592,10 +4640,13 @@ static void load_station_data() {
     } else if (strncmp(line, "call=", 5) == 0) {
       g_call = trim_upper_copy(line + 5);
     } else if (strncmp(line, "grid=", 5) == 0) {
-      g_grid = trim_upper_copy(line + 5);
-      g_grid_saved_manual = g_grid;
-      g_grid_from_gps = false;
-      g_grid_gps_display8.clear();
+      const std::string norm_grid = normalize_grid_maidenhead(line + 5);
+      if (!norm_grid.empty()) {
+        g_grid = norm_grid;
+        g_grid_saved_manual = g_grid;
+        g_grid_from_gps = false;
+        g_grid_gps_display8.clear();
+      }
     } else if (strncmp(line, "comment1=", 9) == 0) {
       g_comment1 = trim_copy(line + 9);
     } else if (strncmp(line, "ignore_prefixes=", 16) == 0) {
@@ -4821,14 +4872,21 @@ static void ble_commit_text_input(const BleUiInput& input) {
     if (menu_edit_idx == 15 && value.size() > 11) value.resize(11);
     if (menu_edit_idx == 17 && value.size() > 10) value.resize(10);
     menu_edit_buf = value;
+    bool should_save = true;
 
     // Absolute indices across pages
-    if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
+    if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, grid_ft8_4(g_grid)); }
     else if (menu_edit_idx == 4) {
-      g_grid = menu_edit_buf;
-      g_grid_saved_manual = g_grid;
-      g_grid_from_gps = false;
-      autoseq_set_station(g_call, g_grid);
+      const std::string norm_grid = normalize_grid_maidenhead(menu_edit_buf);
+      if (!norm_grid.empty()) {
+        g_grid = norm_grid;
+        g_grid_saved_manual = g_grid;
+        g_grid_from_gps = false;
+        autoseq_set_station(g_call, grid_ft8_4(g_grid));
+      } else {
+        should_save = false;
+        ble_notify_payload("ERROR: use GRID AA00/AA00aa/AA00aa00");
+      }
     }
     else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); redraw_countdown_now(); }
     else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
@@ -4850,7 +4908,9 @@ static void ble_commit_text_input(const BleUiInput& input) {
     if (menu_edit_idx == 3) {
       ble_update_name_from_station(true);
     }
-    save_station_data();
+    if (should_save) {
+      save_station_data();
+    }
     menu_edit_idx = -1;
     menu_edit_buf.clear();
     draw_menu_view();
@@ -4950,7 +5010,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   update_autoseq_cq_type();
 
   // Update autoseq with station info after loading
-  autoseq_set_station(g_call, g_grid);
+  autoseq_set_station(g_call, grid_ft8_4(g_grid));
 
   // Prepare RX list (but don't draw yet - startup screen may be shown)
   std::vector<UiRxLine> empty;
@@ -5709,13 +5769,20 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
               break;
             } else if (menu_edit_idx >= 0) {
               if (c == '\n' || c == '\r') {
+                bool should_save = true;
                 // Absolute indices across pages
-                if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
+                if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, grid_ft8_4(g_grid)); }
                 else if (menu_edit_idx == 4) {
-                  g_grid = menu_edit_buf;
-                  g_grid_saved_manual = g_grid;
-                  g_grid_from_gps = false;
-                  autoseq_set_station(g_call, g_grid);
+                  const std::string norm_grid = normalize_grid_maidenhead(menu_edit_buf);
+                  if (!norm_grid.empty()) {
+                    g_grid = norm_grid;
+                    g_grid_saved_manual = g_grid;
+                    g_grid_from_gps = false;
+                    autoseq_set_station(g_call, grid_ft8_4(g_grid));
+                  } else {
+                    should_save = false;
+                    debug_log_line("Grid format: AA00/AA00aa/AA00aa00");
+                  }
                 }
                 else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); redraw_countdown_now(); }
                 else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
@@ -5737,7 +5804,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 if (menu_edit_idx == 3) {
                   ble_update_name_from_station(true);
                 }
-                save_station_data();
+                if (should_save) {
+                  save_station_data();
+                }
                 menu_edit_idx = -1;
                 menu_edit_buf.clear();
                 draw_menu_view();
