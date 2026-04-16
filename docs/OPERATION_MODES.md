@@ -130,7 +130,7 @@ Both 9600 and 115200 GPS will work
                                      └────────────────────────────┘
 ```
 - TX + RX (FT8 QSO)
-  - Use a USB-C to audio/mic adapter for RX
+  - Use a USB-C to audio/mic adapter for RX (Amazon search: B0FWC9ZFC4, other calbes may work too, but this is the one I tested)
   - Add 5V to PORTA, otherwise USB-C OTG port has no power
 ```text
 ┌──────────────────┐
