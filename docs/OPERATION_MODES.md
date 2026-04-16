@@ -47,8 +47,7 @@ Notes:
 
 ## Per-Mode Controls
  - `` ` `` (ESC/backtick) applies wherever is needed.
- - Long Edit (for FreeText, Comment, ActiveBand and IgnoreList): Backspace delete,  `◀` `▶` Move cursor, Hold a key to repeat, `` ` `` Cancel, Enter save
- - Edit (in place): Backspace delete, `` ` `` Cancel, Enter save
+ - Tex Edit: Backspace delete,  `` ` `` Cancel, Enter save
    
 | Mode | Item | Notes |
 |---|---|---|
