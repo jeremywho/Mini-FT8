@@ -1027,6 +1027,18 @@ static void on_decode(const UiRxLine& msg) {
 // Only used on the active zone [0 .. s_active_count)
 // Returns true if left should come before right
 static bool compare_ctx(const QsoContext& left, const QsoContext& right) {
+    // IDLE always sorts first (will be popped by sort_and_clean).
+    if (left.state == AutoseqState::IDLE && right.state != AutoseqState::IDLE) return true;
+    if (right.state == AutoseqState::IDLE && left.state != AutoseqState::IDLE) return false;
+
+    // Free Text is "highest priority non-IDLE" — when the user presses
+    // Send Free Text, the next TX must be the FT, preempting any active
+    // QSO. The QSO's ctx is preserved (FT is one-shot, popped after TX),
+    // so the QSO resumes on the slot after FT fires.
+    if (left.is_freetext != right.is_freetext) {
+        return left.is_freetext;  // FT comes first
+    }
+
     // Same state? Lower retry count gets priority — round-robin among
     // contacts so we probe for viable propagation paths rather than
     // burning all retries on one potentially dead contact.
@@ -1035,8 +1047,8 @@ static bool compare_ctx(const QsoContext& left, const QsoContext& right) {
     }
 
     // Higher state value wins (more advanced in QSO)
-    // DESCENDING order: IDLE(6) > SIGNOFF(5) > ROGERS(4) > ROGER_REPORT(3) > ...
-    // IDLE at front gets popped; more advanced QSOs processed first
+    // DESCENDING order: SIGNOFF(5) > ROGERS(4) > ROGER_REPORT(3) > ...
+    // More advanced QSOs processed first
     return left.state > right.state;  // Higher state comes first
 }
 

@@ -5855,13 +5855,28 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 update_autoseq_cq_type();
                 draw_menu_view();
               } else if (c == '2') {
-                // Send Free Text via autoseq queue. FT is a one-shot CALLING
-                // entry that honors queue parity (inherits from queue[0] if
-                // non-empty, uses "next slot" if empty). This respects active
-                // QSOs — FT waits its turn rather than colliding.
+                // Send Free Text via autoseq queue. FT is a one-shot entry
+                // that sorts to the FRONT of the active queue — guarantees
+                // the next TX is the FT, preempting any active QSO. The QSO
+                // ctx is preserved (FT is one-shot, popped after TX) and
+                // resumes on the slot after FT fires.
+                // Slot parity: inherits from queue[0] if non-empty (joins
+                // the current activation period); uses next-slot fallback
+                // if empty.
                 int64_t now_slot = rtc_now_ms() / 15000;
                 int fallback_parity = (int)((now_slot + 1) & 1);
                 if (autoseq_schedule_freetext(g_free_text, fallback_parity)) {
+                  // Re-fetch and update g_pending_tx so the FT replaces any
+                  // previously-scheduled QSO TX. Without this, a QSO TX
+                  // that was already armed by a prior decode cycle would
+                  // still fire instead of the FT.
+                  AutoseqTxEntry pending;
+                  if (autoseq_fetch_pending_tx(pending)) {
+                    g_qso_xmit = true;
+                    g_pending_tx = pending;
+                    g_pending_tx_valid = true;
+                    g_target_slot_parity = pending.slot_id & 1;
+                  }
                   menu_flash_idx = 1; // absolute index of "Send FreeText"
                   menu_flash_deadline = rtc_now_ms() + 500;
                   draw_menu_view();
