@@ -34,7 +34,7 @@
    ```text
    =============================  (29 `=` Frame Boundary)
    |                           |  (27 bins inside bars)
-   ---+----+----+----+----+----+  (29 `-` with 500Hz tick mark)
+   ---.----+----.----+----.----+  (29 `-` with 500Hz tick mark)
    ```
 4. Line 7 meta/edit line:
    - normal: `[MODE uv]` (`u`/`v` show page-up/page-down availability; `-` means not available)
@@ -100,7 +100,7 @@ Notes:
    - On PC: python .\pc_terminal.py COM11 read 20260113.adi for single command 
 
 ## GPS Connections
-Both 9600 and 115200 GPS will work
+Both 9600 and 115200 GPS modules work (auto detect)
 ```text
 ┌──────────────────┐                 ┌─────────────────────────────┐
 │ GPS              │                 │ Cardputer ADV               │
@@ -112,6 +112,7 @@ Both 9600 and 115200 GPS will work
 └──────────────────┘                 │                             │
                                      │ SW: 5VOUT (Left)            │
                                      └─────────────────────────────┘
+                                     ** For M5 GPSV1.1, SW: 5VIN(Rigth) works too
 ```
 ## KH1 Connections
 
@@ -129,7 +130,7 @@ Both 9600 and 115200 GPS will work
                                      └────────────────────────────┘
 ```
 - TX + RX (FT8 QSO)
-  - Use a USB-C to audio/mic adapter for RX (Amazon search: B0FWC9ZFC4, other calbes may work too, but this is the one I tested)
+  - Use a USB-C to audio/mic adapter for RX (Amazon search: B0FWC9ZFC4, other calbes may work too, but this one was tested)
   - Add 5V to PORTA, otherwise USB-C OTG port has no power
 ```text
 ┌──────────────────┐
@@ -149,3 +150,5 @@ Both 9600 and 115200 GPS will work
                                      └────────────────────────────┘
 ```
 
+- Mini-FT8 will set KH1 Tx power to 2W automatically
+- Reduce AF volume to 05 or 06 for the best Rx performance
