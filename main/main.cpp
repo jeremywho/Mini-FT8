@@ -3282,6 +3282,11 @@ static void tx_start(int skip_tones) {
   ESP_LOGI(TAG, "tx_start: TX=%s offset=%d skip=%d slot=%lld",
            g_pending_tx.text.c_str(), g_pending_tx.offset_hz, skip_tones, (long long)g_tx_slot_idx);
 
+  // Notify autoseq that TX emission is starting. This is the single canonical
+  // logging trigger — if we're about to emit TX4 (RR73) or TX5 (73), autoseq
+  // writes the ADIF entry now.
+  autoseq_on_tx_starting();
+
   // Encode message to tones
   ftx_message_t msg;
   ftx_message_rc_t rc = ftx_message_encode(&msg, &hash_if, g_pending_tx.text.c_str());

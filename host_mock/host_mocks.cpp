@@ -32,7 +32,7 @@ const char* autoseq_state_name(int state) {
 
 const char* tx_msg_type_name(int tx) {
     static const char* names[] = {
-        "TX_UNDEF", "TX1", "TX2", "TX3", "TX4", "TX5", "TX6"
+        "TX_NONE", "TX1", "TX2", "TX3", "TX4", "TX5", "TX6"
     };
     if (tx >= 0 && tx <= 6) return names[tx];
     return "???";

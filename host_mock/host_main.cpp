@@ -183,6 +183,9 @@ int main(int argc, char* argv[]) {
             printf("[Period %d] TX: %s  (slot=%d offset=%dHz)\n",
                    p, pending.text.c_str(), pending.slot_id, pending.offset_hz);
 
+            // Notify autoseq — this is where ADIF logging fires for TX4/TX5
+            autoseq_on_tx_starting();
+
             // Simulate transmission
             autoseq_mark_sent(slot_idx);
 

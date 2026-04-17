@@ -293,14 +293,14 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
                 // No exchange happened (e.g. sent TX1 but got nothing back).
                 // Safe to evict.
                 ctx->state = AutoseqState::IDLE;
-                ctx->next_tx = TxMsgType::TX_UNDEF;
+                ctx->next_tx = TxMsgType::TX_NONE;
             }
             break;
         }
         case AutoseqState::CALLING:  // CQ only once (controlled by beacon)
             // CQ with no response — safe to evict (dxcall is "CQ")
             ctx->state = AutoseqState::IDLE;
-            ctx->next_tx = TxMsgType::TX_UNDEF;
+            ctx->next_tx = TxMsgType::TX_NONE;
             break;
         case AutoseqState::SIGNOFF:
             // After TX5:
@@ -310,7 +310,7 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
                 move_to_inactive(0);
             } else {
                 ctx->state = AutoseqState::IDLE;
-                ctx->next_tx = TxMsgType::TX_UNDEF;
+                ctx->next_tx = TxMsgType::TX_NONE;
             }
             break;
         default:
@@ -336,7 +336,7 @@ bool autoseq_get_next_tx(std::string& out_text) {
     if (s_active_count == 0) return false;
 
     QsoContext* ctx = &s_queue[0];
-    if (ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_UNDEF) {
+    if (ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_NONE) {
         return false;
     }
 
@@ -350,7 +350,7 @@ bool autoseq_fetch_pending_tx(AutoseqTxEntry& out) {
     if (s_active_count == 0) return false;
 
     QsoContext* ctx = &s_queue[0];
-    if (ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_UNDEF) {
+    if (ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_NONE) {
         return false;
     }
 
@@ -377,8 +377,27 @@ void autoseq_mark_sent(int64_t slot_idx) {
     s_last_tx_slot_idx = slot_idx;
     s_last_tx_parity = s_queue[0].slot_id & 1;
 
-    // Logging happens in generate_response() when state transitions to ROGERS/SIGNOFF
+    // Logging now happens in autoseq_on_tx_starting() when TX4/TX5 is emitted
     ESP_LOGI(TAG, "TX sent on slot %lld", slot_idx);
+}
+
+// Called by tx_start() immediately before TX emission. If we're about to emit
+// TX4 (RR73) or TX5 (73), this is the point where the QSO is logged to ADIF.
+// The ctx->logged flag prevents duplicate logs on retries.
+//
+// This is the single canonical logging trigger. It replaces the scattered
+// log_qso_if_needed() calls that used to live in state machine transitions.
+// Logging at TX emission (rather than RX state transition) guarantees:
+//   (a) We only log QSOs we actually attempted to complete (emitted RR73/73).
+//   (b) Log timestamps are unique per TX slot (only one TX per slot).
+//   (c) snr_tx/snr_rx are both latched by the time we reach ROGERS/SIGNOFF
+//       (we reached those states via parse_rcvd_msg updates on received TX2/TX3).
+void autoseq_on_tx_starting() {
+    if (s_active_count == 0) return;
+    QsoContext* ctx = &s_queue[0];
+    if (ctx->next_tx == TxMsgType::TX4 || ctx->next_tx == TxMsgType::TX5) {
+        log_qso_if_needed(ctx);
+    }
 }
 
 void autoseq_get_qso_states(std::vector<std::string>& out) {
@@ -592,7 +611,7 @@ static TxMsgType parse_rcvd_msg(QsoContext* ctx, const UiRxLine& msg) {
 
 
 
-    TxMsgType rcvd = TxMsgType::TX_UNDEF;
+    TxMsgType rcvd = TxMsgType::TX_NONE;
 
     std::string f3 = msg.field3;
     for (auto& ch : f3) ch = toupper((unsigned char)ch);
@@ -672,8 +691,8 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
     ESP_LOGI(TAG, "generate_response: override=%d, rcvd=%d, ctx->state=%d",
              override, (int)rcvd, (int)ctx->state);
 
-    if (rcvd == TxMsgType::TX_UNDEF) {
-        ESP_LOGW(TAG, "generate_response: rcvd=TX_UNDEF, returning false");
+    if (rcvd == TxMsgType::TX_NONE) {
+        ESP_LOGW(TAG, "generate_response: rcvd=TX_NONE, returning false");
         return false;
     }
 
@@ -708,19 +727,19 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
         // Reset state based on received message type
         switch (rcvd) {
             case TxMsgType::TX1:
-                set_state(ctx, AutoseqState::CALLING, TxMsgType::TX_UNDEF, 0);
+                set_state(ctx, AutoseqState::CALLING, TxMsgType::TX_NONE, 0);
                 break;
             case TxMsgType::TX2:
-                set_state(ctx, AutoseqState::REPLYING, TxMsgType::TX_UNDEF, 0);
+                set_state(ctx, AutoseqState::REPLYING, TxMsgType::TX_NONE, 0);
                 break;
             case TxMsgType::TX3:
-                set_state(ctx, AutoseqState::REPORT, TxMsgType::TX_UNDEF, 0);
+                set_state(ctx, AutoseqState::REPORT, TxMsgType::TX_NONE, 0);
                 break;
             case TxMsgType::TX4:
-                set_state(ctx, AutoseqState::ROGER_REPORT, TxMsgType::TX_UNDEF, 0);
+                set_state(ctx, AutoseqState::ROGER_REPORT, TxMsgType::TX_NONE, 0);
                 break;
             case TxMsgType::TX5:
-                set_state(ctx, AutoseqState::ROGERS, TxMsgType::TX_UNDEF, 0);
+                set_state(ctx, AutoseqState::ROGERS, TxMsgType::TX_NONE, 0);
                 break;
             default:
                 break;
@@ -729,13 +748,13 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
 
     // State machine transitions.
     //
-    // INVARIANT: Every active ctx with state != IDLE must have next_tx != TX_UNDEF.
+    // INVARIANT: Every active ctx with state != IDLE must have next_tx != TX_NONE.
     // Each state handler explicitly handles every rcvd type. The "no-op" default
     // case (DX sent something that doesn't advance our state) refreshes next_tx
     // to the canonical value for the current state — i.e. "keep sending what we
     // were sending before." This makes generate_response a total function over
     // (state, rcvd) and repairs the invariant even if a caller (like reactivate)
-    // passes in a ctx with a stale TX_UNDEF.
+    // passes in a ctx with a stale TX_NONE.
     switch (ctx->state) {
         case AutoseqState::CALLING:  // We sent CQ
             // CQ is short-lived by design: autoseq_start_cq sets next_tx=TX6,
@@ -750,9 +769,6 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
             //    immediately transitions via the TX1 case below.
             //  - CALLING ctxs never enter the inactive zone (tick pops them
             //    directly), so reactivation never produces CALLING.
-            // Therefore no next_tx refresh is needed — the invariant is
-            // maintained by construction. Refreshing to TX6 would wrongly
-            // re-send CQ and violate the short-lived design.
             switch (rcvd) {
                 case TxMsgType::TX1:
                     set_state(ctx, AutoseqState::REPORT, TxMsgType::TX2, s_max_retry);
@@ -761,9 +777,14 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                     set_state(ctx, AutoseqState::ROGER_REPORT, TxMsgType::TX3, s_max_retry);
                     return true;
                 case TxMsgType::TX3:
+                    // Advance to ROGERS; logging happens when TX4 is emitted.
                     set_state(ctx, AutoseqState::ROGERS, TxMsgType::TX4, s_max_retry);
-                    log_qso_if_needed(ctx);
                     return true;
+                case TxMsgType::TX5:
+                    // Receive 73 = terminal. Evict immediately. No log (never
+                    // reached ROGERS/SIGNOFF; we never emitted TX4/TX5 ourselves).
+                    set_state(ctx, AutoseqState::IDLE, TxMsgType::TX_NONE, 0);
+                    return false;
                 default:
                     return false;
             }
@@ -775,14 +796,17 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                     return true;
                 case TxMsgType::TX3:
                     set_state(ctx, AutoseqState::ROGERS, TxMsgType::TX4, s_max_retry);
-                    log_qso_if_needed(ctx);
                     return true;
                 case TxMsgType::TX4:
-                case TxMsgType::TX5:
+                    // DX sent RR73 skipping normal exchange. Advance to SIGNOFF;
+                    // we'll emit TX5 (73) and log on that emission.
                     set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, 0);
                     ctx->park_after_signoff_tx = true;
-                    log_qso_if_needed(ctx);
                     return true;
+                case TxMsgType::TX5:
+                    // Receive 73 = terminal. Evict immediately, no log.
+                    set_state(ctx, AutoseqState::IDLE, TxMsgType::TX_NONE, 0);
+                    return false;
                 default:
                     // No-op (e.g. DX resent TX1): keep sending our grid
                     ctx->next_tx = TxMsgType::TX1;
@@ -799,14 +823,15 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                     return true;
                 case TxMsgType::TX3:
                     set_state(ctx, AutoseqState::ROGERS, TxMsgType::TX4, s_max_retry);
-                    log_qso_if_needed(ctx);
                     return true;
                 case TxMsgType::TX4:
-                case TxMsgType::TX5:
                     set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, 0);
                     ctx->park_after_signoff_tx = true;
-                    log_qso_if_needed(ctx);
                     return true;
+                case TxMsgType::TX5:
+                    // Receive 73 = terminal. Evict immediately, no log.
+                    set_state(ctx, AutoseqState::IDLE, TxMsgType::TX_NONE, 0);
+                    return false;
                 default:
                     // No-op (e.g. DX resent TX1 grid): keep sending our report
                     ctx->next_tx = TxMsgType::TX2;
@@ -816,28 +841,30 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
         case AutoseqState::ROGER_REPORT:  // We sent TX3 (R+report)
             switch (rcvd) {
                 case TxMsgType::TX4:
-                case TxMsgType::TX5:
                     set_state(ctx, AutoseqState::SIGNOFF, TxMsgType::TX5, s_max_retry);
                     ctx->park_after_signoff_tx = true;
-                    log_qso_if_needed(ctx);
                     return true;
+                case TxMsgType::TX5:
+                    // Receive 73 = terminal. We never emitted TX4/TX5 → no log.
+                    set_state(ctx, AutoseqState::IDLE, TxMsgType::TX_NONE, 0);
+                    return false;
                 default:
                     // No-op (DX resent TX1/TX2/TX3): keep sending R+report
                     ctx->next_tx = TxMsgType::TX3;
                     return false;
             }
 
-        case AutoseqState::ROGERS:  // We sent TX4 (RR73)
+        case AutoseqState::ROGERS:  // We sent TX4 (RR73) — already logged on emission
             switch (rcvd) {
                 case TxMsgType::TX3:
                     // DX didn't get our RR73 — re-send with fresh retries.
-                    // Already logged at ROGERS entry; logged flag prevents duplicate.
                     set_state(ctx, AutoseqState::ROGERS, TxMsgType::TX4, s_max_retry);
                     return true;
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
-                    // Already logged at ROGERS entry - just mark complete
-                    set_state(ctx, AutoseqState::IDLE, TxMsgType::TX_UNDEF, 0);
+                    // Receive RR73/73 after we sent RR73 = terminal.
+                    // Already logged on TX4 emission; no extra action needed.
+                    set_state(ctx, AutoseqState::IDLE, TxMsgType::TX_NONE, 0);
                     return false;
                 default:
                     // No-op (DX resent TX1/TX2): keep sending RR73
@@ -845,7 +872,7 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                     return false;
             }
 
-        case AutoseqState::SIGNOFF:  // We sent TX5 (73)
+        case AutoseqState::SIGNOFF:  // We sent TX5 (73) — already logged on emission
             switch (rcvd) {
                 case TxMsgType::TX4:
                     // Late RR73: send another 73 and park inactive again.
@@ -853,8 +880,8 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                     ctx->park_after_signoff_tx = true;
                     return true;
                 case TxMsgType::TX5:
-                    // Late 73: finish with no further TX.
-                    set_state(ctx, AutoseqState::IDLE, TxMsgType::TX_UNDEF, 0);
+                    // Receive 73 = terminal. Already logged.
+                    set_state(ctx, AutoseqState::IDLE, TxMsgType::TX_NONE, 0);
                     ctx->park_after_signoff_tx = false;
                     return false;
                 default:
@@ -1003,7 +1030,7 @@ static void move_to_inactive(int idx) {
 
     // Copy to inactive zone (grows leftward)
     QsoContext saved = s_queue[idx];
-    saved.next_tx = TxMsgType::TX_UNDEF;
+    saved.next_tx = TxMsgType::TX_NONE;
     saved.inactive_since_ms = mono_ms();
 
     // Remove from active zone by shifting

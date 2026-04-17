@@ -25,7 +25,7 @@ enum class AutoseqState {
 
 // FT8 message types
 enum class TxMsgType {
-    TX_UNDEF = 0,
+    TX_NONE = 0,
     TX1,  // <DXCALL> <MYCALL> <GRID>
     TX2,  // <DXCALL> <MYCALL> ##
     TX3,  // <DXCALL> <MYCALL> R##
@@ -37,8 +37,8 @@ enum class TxMsgType {
 // QSO context - one per active contact
 struct QsoContext {
     AutoseqState state = AutoseqState::IDLE;
-    TxMsgType next_tx = TxMsgType::TX_UNDEF;
-    TxMsgType rcvd_msg_type = TxMsgType::TX_UNDEF;
+    TxMsgType next_tx = TxMsgType::TX_NONE;
+    TxMsgType rcvd_msg_type = TxMsgType::TX_NONE;
 
     std::string dxcall;     // Remote station callsign
     std::string dxgrid;     // Remote grid (preserved from initial exchange!)
@@ -115,8 +115,13 @@ bool autoseq_get_next_tx(std::string& out_text);
 bool autoseq_fetch_pending_tx(AutoseqTxEntry& out);
 
 // Mark TX as sent (called after transmission completes)
-// Note: ADIF logging happens in generate_response() state transitions
 void autoseq_mark_sent(int64_t slot_idx);
+
+// Called from tx_start() immediately before TX emission begins.
+// Logs the QSO if we're about to emit TX4 (RR73) or TX5 (73) — this is the
+// single logging trigger. ctx->logged flag prevents duplicate logs across
+// retries or re-emissions.
+void autoseq_on_tx_starting();
 
 // Get display strings for active QSOs
 void autoseq_get_qso_states(std::vector<std::string>& out);
