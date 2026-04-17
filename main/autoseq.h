@@ -31,11 +31,12 @@ enum class AutoseqState {
 //
 // TX6 is the FT8 CQ message but is NEVER assigned to next_tx. CQ ctxs
 // (and the Free Text variant that piggy-backs on the CQ infrastructure)
-// use next_tx = TX_NONE — text comes from format_one_shot_text(), which
-// reads ctx->pending_text for FT or generates the CQ template for CQ.
+// use next_tx = TX_NONE — text comes from the singleton s_tx_msg_buffer,
+// populated at refresh time by either generate_cq_text_into() (for CQ)
+// or from the s_pending_ft_text sidecar (for FT).
 //
 // Semantics of TX_NONE on next_tx:
-//   - On a CALLING ctx: "one-shot — text from preloaded source, evict
+//   - On a CALLING ctx: "one-shot — text from s_tx_msg_buffer, evict
 //     after one TX (tick CALLING → IDLE → pop)."
 //   - On an IDLE ctx: "no TX, evict immediately by sort_and_clean."
 enum class TxMsgType {
@@ -77,10 +78,14 @@ struct QsoContext {
     int slot_id = 0;        // TX slot (0=even, 1=odd)
 
     // One-shot entries (CQ and Free Text) share the CALLING state but differ
-    // in text source: CQ text is generated from template, FT text is user-
-    // provided and stored here. is_freetext distinguishes the two.
+    // in sort priority: FT must TX first (preempts QSOs), CQ stays at bottom
+    // (QSOs take priority over beacon CQ). is_freetext is the priority flag
+    // consulted in compare_ctx.
+    //
+    // Text storage: CQ text is regenerated from template at refresh; FT text
+    // is held in the s_pending_ft_text singleton (only one FT pending at a
+    // time, so one sidecar suffices). No per-ctx text field is needed.
     bool is_freetext = false;
-    std::string pending_text;  // populated for FT one-shots; empty otherwise
 };
 
 // TX entry for scheduling

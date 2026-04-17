@@ -33,6 +33,13 @@ static int s_inactive_start = AUTOSEQ_MAX_QUEUE;  // no inactive entries
 // are pure reads of this buffer — they do not consult next_tx.
 static std::string s_tx_msg_buffer;
 
+// Singleton sidecar for Free Text content. Holds the user-provided text
+// while an FT one-shot is in the queue. Overwritten on each injection
+// (only one FT pending at a time by construction). Unused/stale when no
+// FT ctx is in the queue — safe because refresh consults it only when
+// queue[0].is_freetext is true.
+static std::string s_pending_ft_text;
+
 // Station configuration
 static std::string s_my_call;
 static std::string s_my_grid;
@@ -112,6 +119,7 @@ void autoseq_init() {
     s_last_tx_slot_idx = -1000;
     s_last_tx_parity = -1;
     s_tx_msg_buffer.clear();
+    s_pending_ft_text.clear();
 }
 
 void autoseq_clear() {
@@ -172,14 +180,13 @@ bool autoseq_rotate_same_parity() {
 // Returns the appended ctx, or nullptr if no room.
 // Inject a one-shot CALLING entry. The caller is responsible for:
 //   - Choosing the dxcall marker ("CQ" for beacon CQ, "(FT)" for Free Text)
-//   - Providing the fully-formed TX text (preloaded into ctx->pending_text)
-//   - Setting is_freetext correctly (used for sort priority, not text source)
+//   - Setting is_freetext (sort priority — FT above QSOs, CQ below)
 //   - Picking the slot parity
-// The helper is type-agnostic — it doesn't inspect the text to infer type.
+// Text is NOT stored on the ctx; it's derived at refresh time from either
+// the CQ template (for CQ) or the s_pending_ft_text sidecar (for FT).
 // Returns the appended ctx, or nullptr if no room.
 static QsoContext* enqueue_one_shot(const std::string& dxcall,
                                     bool is_freetext,
-                                    const std::string& pending_text,
                                     int slot_parity) {
     if (s_inactive_start <= s_active_count) {
         evict_oldest_inactive();
@@ -191,10 +198,9 @@ static QsoContext* enqueue_one_shot(const std::string& dxcall,
     ctx->snr_tx = -99;
     ctx->snr_rx = -99;
     ctx->slot_id = slot_parity;
-    ctx->is_freetext = is_freetext;  // for compare_ctx priority (FT above CQ)
-    ctx->pending_text = pending_text;
-    // next_tx = TX_NONE marks this ctx as "evict after tick." The text
-    // source is ctx->pending_text (via refresh_tx_msg_buffer), not next_tx.
+    ctx->is_freetext = is_freetext;  // compare_ctx priority (FT above CQ)
+    // next_tx = TX_NONE marks this ctx as "evict after tick." Text source
+    // is determined by is_freetext at refresh time — decoupled from next_tx.
     set_state(ctx, AutoseqState::CALLING, TxMsgType::TX_NONE, 0);
     return ctx;
 }
@@ -206,10 +212,7 @@ void autoseq_start_cq(int slot_parity) {
             return;
         }
     }
-    // Generate CQ text NOW (caller knows the type — no inference later).
-    std::string cq_text;
-    generate_cq_text_into(cq_text);
-    if (enqueue_one_shot("CQ", false, cq_text, slot_parity)) {
+    if (enqueue_one_shot("CQ", false, slot_parity)) {
         ESP_LOGI(TAG, "Started CQ on slot %d", slot_parity);
         refresh_tx_msg_buffer();
     }
@@ -227,8 +230,10 @@ bool autoseq_schedule_freetext(const std::string& text, int fallback_slot_parity
     int slot_parity = (s_active_count > 0)
                         ? (s_queue[0].slot_id & 1)
                         : (fallback_slot_parity & 1);
-    // FT text is the user-provided string directly — no template involvement.
-    QsoContext* ctx = enqueue_one_shot("(FT)", true, text, slot_parity);
+    // Write the user text to the sidecar BEFORE enqueuing, so refresh can
+    // find it as soon as the ctx appears at queue[0].
+    s_pending_ft_text = text;
+    QsoContext* ctx = enqueue_one_shot("(FT)", true, slot_parity);
     if (ctx) {
         ESP_LOGI(TAG, "Scheduled Free Text on slot %d: %s", slot_parity, text.c_str());
         // Sort so FT lands at the correct position (top, above QSOs).
@@ -493,13 +498,9 @@ void autoseq_set_cabrillo_fd_callback(CabrilloFdLogCallback cb) {
 void autoseq_set_station(const std::string& call, const std::string& grid) {
     s_my_call = call;
     s_my_grid = grid;
-    // An enqueued CQ ctx would have cached the template with the old station
-    // — refresh so pending CQ reflects the new call/grid. (Rare but correct.)
-    if (s_active_count > 0 && s_queue[0].state == AutoseqState::CALLING
-        && !s_queue[0].is_freetext) {
-        generate_cq_text_into(s_queue[0].pending_text);
-        refresh_tx_msg_buffer();
-    }
+    // CQ template is regenerated on every refresh, so just re-derive the
+    // buffer if a CQ ctx is currently at queue[0].
+    refresh_tx_msg_buffer();
 }
 
 void autoseq_set_skip_tx1(bool skip) {
@@ -522,12 +523,7 @@ void autoseq_set_max_retry(int retry) {
 void autoseq_set_cq_type(AutoseqCqType type, const std::string& freetext) {
     s_cq_type = type;
     s_cq_freetext = freetext;
-    // Refresh cached CQ text if there's a CQ ctx at the front.
-    if (s_active_count > 0 && s_queue[0].state == AutoseqState::CALLING
-        && !s_queue[0].is_freetext) {
-        generate_cq_text_into(s_queue[0].pending_text);
-        refresh_tx_msg_buffer();
-    }
+    refresh_tx_msg_buffer();  // re-derive CQ template if CQ is at queue[0]
 }
 
 // ============== Internal helpers ==============
@@ -539,27 +535,37 @@ static void set_state(QsoContext* ctx, AutoseqState s, TxMsgType first_tx, int l
     ctx->retry_limit = limit;
 }
 
-// Recompute s_tx_msg_buffer from queue[0]. This is the sole writer of the
-// TX text buffer (aside from enqueue_one_shot which also populates ctx->
-// pending_text). Called at the end of every public API that may change
-// queue[0]'s identity or text source.
+// Recompute s_tx_msg_buffer from queue[0]. Sole writer of the TX text
+// buffer. Called at the end of every public API that may change queue[0]'s
+// identity or text source.
 //
 // Sources of text:
 //   queue empty            → buffer cleared
 //   queue[0] state IDLE    → buffer cleared (defensive; sort_and_clean should
 //                            have popped IDLE entries first)
-//   queue[0] state CALLING → copy from ctx->pending_text (populated at
-//                            enqueue for both CQ and FT one-shots)
+//   queue[0] state CALLING → text comes from one of two sources, picked by
+//                            is_freetext:
+//                              - is_freetext=true:  s_pending_ft_text (sidecar)
+//                              - is_freetext=false: regenerated CQ template
 //   queue[0] other state   → derive via format_tx_text from ctx->next_tx
-//                            (this is the QSO state machine path)
+//                            (the QSO state machine path)
+//
+// Text storage rationale: QSO text is derivable from state every time. CQ
+// template is cheap to regenerate (and picks up any cq_type/station changes
+// automatically). FT text is user-supplied and not derivable, so it lives
+// in the s_pending_ft_text sidecar (only one FT pending at a time, so a
+// single sidecar suffices).
 static void refresh_tx_msg_buffer() {
     s_tx_msg_buffer.clear();
     if (s_active_count == 0) return;
     QsoContext* ctx = &s_queue[0];
     if (ctx->state == AutoseqState::IDLE) return;
     if (ctx->state == AutoseqState::CALLING) {
-        // One-shot entry (CQ or FT): text was populated at enqueue.
-        s_tx_msg_buffer = ctx->pending_text;
+        if (ctx->is_freetext) {
+            s_tx_msg_buffer = s_pending_ft_text;
+        } else {
+            generate_cq_text_into(s_tx_msg_buffer);
+        }
         return;
     }
     // QSO ctx: derive from state machine.
