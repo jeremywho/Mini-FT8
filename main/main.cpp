@@ -5076,14 +5076,17 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     debug_update_app_core0_stack_hud(false);
   }
 
-  // Key injection queue for console UART RX (G15)
+  // Key injection queue for console UART RX
   s_key_inject_queue = xQueueCreate(32, sizeof(char));
 
-  // sdkconfig puts the ESP console on UART0 peripheral with TX=G13,
+  // sdkconfig puts the ESP console on UART0 peripheral with a custom TX pin,
   // but IDF's custom-console init only guarantees the TX pin routing —
-  // it doesn't always hook up RX. Explicitly route G15 to UART0 RXD.
-  // This is a no-op if already set, and doesn't install a driver.
-  uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, GPIO_NUM_15,
+  // it doesn't always hook up RX. Explicitly route the configured RX GPIO
+  // to UART0 RXD. This is a no-op if already set, and doesn't install a
+  // driver. Using CONFIG_ESP_CONSOLE_UART_RX_GPIO keeps this in sync with
+  // sdkconfig automatically.
+  uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE,
+               (gpio_num_t)CONFIG_ESP_CONSOLE_UART_RX_GPIO,
                UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
   // Drain any stale bytes left in the FIFO from ROM-bootloader time
   // (when UART0 RX was still on its IO_MUX default pin, likely floating).
