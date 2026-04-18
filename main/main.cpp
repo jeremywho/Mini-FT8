@@ -21,6 +21,7 @@ extern "C" {
 #include "freertos/queue.h"
 #include "esp_heap_caps.h"
 #include "autoseq.h"
+#include "core_api.h"
 #include <M5Cardputer.h>
 #include <sstream>
 #include <iterator>
@@ -964,13 +965,9 @@ static volatile bool g_was_txing = false;       // We were transmitting (for tic
 volatile bool g_decode_in_progress = false; // Block TX trigger while decoding
 static int g_last_slot_parity = -1;             // For slot boundary detection (just parity, like reference)
 
-//enum class BeaconMode { OFF = 0, EVEN, EVEN2, ODD, ODD2 };
-enum class BeaconMode { OFF = 0, EVEN, ODD };
-struct BandItem {
-  const char* name;
-  int freq;
-};
-static std::vector<BandItem> g_bands = {
+// BeaconMode and BandItem now defined in station_types.h
+#include "station_types.h"
+std::vector<BandItem> g_bands = {   // visible to core_api.cpp
     {"160m", 1840},   {"80m", 3573},   {"60m", 5357},   {"40m", 7074},
     {"30m", 10136},   {"20m", 14074},  {"17m", 18100},  {"15m", 21074},
     {"12m", 24915},   {"10m", 28074},  {"6m", 50313},   {"2m", 144174},
@@ -980,16 +977,15 @@ static std::vector<int> g_active_band_indices;
 static int band_page = 0;
 static int band_edit_idx = -1;       // absolute index into g_bands
 static std::string band_edit_buffer; // text while editing
-static void update_autoseq_cq_type();
-static void update_autoseq_cq_type();
-static BeaconMode g_beacon = BeaconMode::OFF;
-static int g_offset_hz = 1500;
-static int g_band_sel = 1; // default 80m
+void update_autoseq_cq_type();  // visible to core_api.cpp
+BeaconMode g_beacon = BeaconMode::OFF;   // visible to core_api.cpp
+int g_offset_hz = 1500;                  // visible to core_api.cpp
+int g_band_sel = 1; // default 80m       // visible to core_api.cpp
 static bool g_tune = false;
 static BeaconMode g_status_beacon_temp = BeaconMode::OFF;
 [[maybe_unused]] static bool g_cat_toggle_high = false;
-static std::string g_date = "2025-12-11";
-static std::string g_time = "10:10:00";
+std::string g_date = "2025-12-11";      // visible to core_api.cpp
+std::string g_time = "10:10:00";        // visible to core_api.cpp
 static int status_edit_idx = -1;     // 0-5
 static std::string status_edit_buffer;
 static int status_cursor_pos = -1;
@@ -1006,7 +1002,7 @@ static bool g_ble_dump_in_progress = false;
 static UIMode g_ble_qso_return_mode = UIMode::RX;
 
 static void host_handle_line(const std::string& line);
-static void save_station_data();
+void save_station_data();  // visible to core_api.cpp
 // TX entry for display and scheduling (populated by autoseq)
 static AutoseqTxEntry g_pending_tx;
 static bool g_pending_tx_valid = false;
@@ -1021,8 +1017,8 @@ static void enter_mode(UIMode new_mode);
 static void apply_ble_enabled_policy(bool runtime_apply);
 static std::string menu_sleep_batt_line();
 static int normalize_gps_baud_value(int value);
-static bool rtc_set_from_strings();
-static void rtc_sync_to_hw();
+bool rtc_set_from_strings();   // visible to core_api.cpp
+void rtc_sync_to_hw();         // visible to core_api.cpp
 static bool g_rx_dirty = false;
 #if ENABLE_BLE
 static void ble_enter_text_mode();
@@ -1130,27 +1126,25 @@ static bool rtc_valid = false;
 // rtc_comp is seconds per 10000 seconds and can be adjusted via MENU O page.
 static constexpr int kRtcCompFixed = 120;
 static time_t g_rtc_sleep_epoch = 0;
-static int g_rtc_comp = kRtcCompFixed;
+int g_rtc_comp = kRtcCompFixed;        // visible to core_api.cpp
 static int clamp_rtc_comp_value(int value) {
   if (value < -9000) return -9000;
   if (value > 9000) return 9000;
   return value;
 }
 
-enum class CqType { CQ, CQSOTA, CQPOTA, CQQRP, CQFD, CQFREETEXT };
-enum class OffsetSrc { RANDOM, CURSOR, RX };
-enum class RadioType { NONE, TRUSDX, QMX, KH1 };
+// CqType, OffsetSrc, RadioType now defined in station_types.h
 struct RadioProfileBinding {
   audio_source_backend_t audio_backend;
   radio_control_backend_t radio_backend;
 };
-static CqType g_cq_type = CqType::CQ;
-static std::string g_cq_freetext = "FreeText";
-static bool g_skip_tx1 = false;
-static int g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;
+CqType g_cq_type = CqType::CQ;                // visible to core_api.cpp
+std::string g_cq_freetext = "FreeText";       // visible to core_api.cpp
+bool g_skip_tx1 = false;                      // visible to core_api.cpp
+int g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;  // visible to core_api.cpp
 static std::string g_free_text = "TNX 73";
-static std::string g_call = "YOURCALL";
-static std::string g_grid = "CM97";
+std::string g_call = "YOURCALL";   // visible to core_api.cpp
+std::string g_grid = "CM97";       // visible to core_api.cpp
 static std::string g_grid_saved_manual = "CM97";
 static bool g_grid_from_gps = false;
 static bool g_time_synced_from_gps = false;
@@ -1158,18 +1152,18 @@ static std::string g_grid_gps_display8;
 bool g_decode_enabled = true;
 int g_time_osr = 2;
 int g_freq_osr = 1;
-static OffsetSrc g_offset_src = OffsetSrc::RANDOM;
-static RadioType g_radio = RadioType::QMX;
+OffsetSrc g_offset_src = OffsetSrc::RANDOM;  // visible to core_api.cpp
+RadioType g_radio = RadioType::QMX;          // visible to core_api.cpp
 static bool g_kh1_connected = false;
 static int g_gps_baud = 115200;
 static constexpr size_t kIgnorePrefixTextMaxLen = 64;
-static std::string g_comment1 = "MiniFT8 /Radio";
+std::string g_comment1 = "MiniFT8 /Radio";      // visible to core_api.cpp
 static std::string g_ignore_prefix_text;
-static std::vector<std::string> g_ignore_prefixes;
+std::vector<std::string> g_ignore_prefixes;     // visible to core_api.cpp
 static bool g_rxtx_log = true;
 static RadioType canonical_radio_type(RadioType r);
 static RadioProfileBinding get_radio_profile_binding(RadioType r);
-static void apply_radio_profile_binding();
+void apply_radio_profile_binding();   // visible to core_api.cpp
 static void gps_runtime_tick();
 static std::string expand_comment_macros(const std::string& src);
 static std::string normalize_grid_maidenhead(const std::string& src);
@@ -1220,7 +1214,7 @@ static uint8_t g_own_addr_type;
 static bool looks_like_grid(const std::string& s);
 static bool looks_like_report(const std::string& s, int& out);
 static std::string g_last_reply_text;
-static void rebuild_active_bands();
+void rebuild_active_bands();   // visible to core_api.cpp
 static void schedule_tx_if_idle();
 static int64_t s_last_tx_slot_idx = -1000;  // Track last TX slot for retry scheduling
 [[maybe_unused]] static bool g_sync_pending = false;
@@ -2047,7 +2041,7 @@ static const char* radio_name(RadioType r) {
   return "None";
 }
 
-static void apply_radio_profile_binding() {
+void apply_radio_profile_binding() {
   audio_source_backend_t prev_audio = audio_source_get_backend();
   g_radio = canonical_radio_type(g_radio);
   g_gps_baud = normalize_gps_baud_value(g_gps_baud);
@@ -2240,7 +2234,7 @@ static std::string expand_comment1() {
   return expand_comment_macros(g_comment1);
 }
 
-static void rebuild_ignore_prefixes() {
+void rebuild_ignore_prefixes() {
   g_ignore_prefixes.clear();
   std::istringstream iss(g_ignore_prefix_text);
   std::string tok;
@@ -2412,7 +2406,7 @@ static std::string highlight_pos(const std::string& s, int pos) {
 
 static void draw_status_view();
 
-static bool rtc_set_from_strings() {
+bool rtc_set_from_strings() {
   int y, M, d, h, m, s;
   if (sscanf(g_date.c_str(), "%d-%d-%d", &y, &M, &d) != 3) return false;
   if (sscanf(g_time.c_str(), "%d:%d:%d", &h, &m, &s) != 3) return false;
@@ -2490,7 +2484,7 @@ static bool rtc_init_from_hw() {
 }
 
 // Sync hardware RTC from soft RTC (call after FT8 time sync)
-static void rtc_sync_to_hw() {
+void rtc_sync_to_hw() {
   if (!rtc_valid) return;
 
   time_t now = rtc_epoch_base + (esp_timer_get_time() / 1000 - rtc_ms_start) / 1000;
@@ -2721,7 +2715,7 @@ static int band_number_from_name(const std::string& name) {
   return num;
 }
 
-static void rebuild_active_bands() {
+void rebuild_active_bands() {
   std::string cleaned = g_active_band_text;
   for (char& c : cleaned) {
     if (c == ',' || c == '/' || c == '\\' || c == ';') c = ' ';
@@ -2759,7 +2753,7 @@ static void rebuild_active_bands() {
   g_active_band_text = oss.str();
 }
 
-static void update_autoseq_cq_type() {
+void update_autoseq_cq_type() {
   AutoseqCqType t = AutoseqCqType::CQ;
   switch (g_cq_type) {
     case CqType::CQSOTA: t = AutoseqCqType::SOTA; break;
@@ -4764,7 +4758,7 @@ static void load_station_data() {
   apply_ble_enabled_policy(false);
 }
 
-static void save_station_data() {
+void save_station_data() {
   FILE* f = fopen(STATION_FILE, "w");
   if (!f) {
     ESP_LOGE(TAG, "Failed to open %s for write", STATION_FILE);
@@ -5075,6 +5069,11 @@ static void app_task_core0(void* /*param*/) {
 
   // Initialize autoseq engine
   autoseq_init();
+
+  // Initialize the functional-core API (creates internal sync primitives).
+  // After this, core_api.h consumers (Cardputer UI, future BLE server) can
+  // safely call core_get_*, core_cmd_*, and register callbacks.
+  core_init();
   
 // Cabrillo Field Day log callback (implemented in autoseq.cpp; declared here to avoid header churn)
 using CabrilloFdLogCallback = void (*)(const std::string& dxcall, const std::string& their_fd_exchange);

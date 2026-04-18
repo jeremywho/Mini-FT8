@@ -19,6 +19,7 @@ extern "C" {
 }
 
 #include "ui.h"
+#include "core_api_internal.h"
 #include <cstring>
 #include <cmath>
 #include <inttypes.h>
@@ -171,6 +172,11 @@ static void push_waterfall_latest(const monitor_t& mon) {
     memcpy(s_latest_waterfall_row, scaled, width);
     s_latest_waterfall_row_valid = true;
     taskEXIT_CRITICAL(&s_latest_waterfall_row_lock);
+
+    // Feed the full-resolution (collapsed) row to the functional core.
+    // Stubbed swr/pwr/ptt until real polling lands (see NATIVE_CLIENT_ARCHITECTURE.md).
+    core_fire_waterfall_row(block, collapsed, num_bins,
+                            /*swr=*/1.5f, /*pwr=*/2.0f, /*ptt=*/false);
 }
 
 // CDC-ACM helpers (CAT TX only)

@@ -486,6 +486,14 @@ int autoseq_queue_size() {
     return s_active_count;
 }
 
+void autoseq_get_active_contexts(std::vector<QsoContext>& out) {
+    out.clear();
+    out.reserve(s_active_count);
+    for (int i = 0; i < s_active_count; ++i) {
+        out.push_back(s_queue[i]);
+    }
+}
+
 void autoseq_set_adif_callback(AdifLogCallback cb) {
     s_adif_callback = cb;
 }
