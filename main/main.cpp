@@ -931,7 +931,7 @@ static bool rewrite_dxpedition_for_mycall(const std::string& raw_text,
 }
 
 static const char* TAG = "FT8";
-enum class UIMode { RX, TX, BAND, MENU, CONTROL, DEBUG, STATUS, QSO };
+enum class UIMode { RX, TX, BAND, MENU, CONTROL, DEBUG, STATUS, QSO, GPS };
 static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
 // NOTE: previous `std::vector<UiRxLine> g_rx_lines` was removed to eliminate
@@ -2083,6 +2083,8 @@ static std::string lat_lon_to_maidenhead8(double lat, double lon) {
   return out;
 }
 
+static void draw_gps_view(bool force_redraw = false);
+
 static void gps_runtime_tick() {
   static int64_t s_last_apply_ms = 0;
   static bool s_time_synced_once = false;
@@ -2105,6 +2107,10 @@ static void gps_runtime_tick() {
   const int64_t now = rtc_now_ms();
   if ((now - s_last_apply_ms) < 1000) return;
   s_last_apply_ms = now;
+
+  if (ui_mode == UIMode::GPS) {
+    draw_gps_view();
+  }
 
   gps_state_t st = gps_get_state();
   if (!st.valid_fix) return;
@@ -2156,6 +2162,7 @@ static void gps_runtime_tick() {
         if (hour_key >= 0) s_last_time_sync_hour_key = hour_key;
         changed = true;
         ESP_LOGI(TAG, "GPS time synced: %s %s", g_date.c_str(), g_time.c_str());
+        radio_control_set_time(h, m, s);
       } else {
         g_date = old_date;
         g_time = old_time;
@@ -3552,6 +3559,51 @@ static std::string status_sync_line() {
   return std::string("Connect to ") + radio_name(radio);
 }
 
+static std::string s_last_gps_lines[6];
+
+static void draw_gps_view(bool force_redraw) {
+  std::vector<std::string> lines;
+  lines.reserve(6);
+  gps_state_t state = gps_get_state();
+  lines.push_back("--- GPS TELEMETRY ---");
+  if (state.valid_fix) {
+    lines.push_back(std::string("Fix: 3D (") + std::to_string(state.satellites) + " Sats)");
+  } else {
+    lines.push_back(std::string("Fix: NO FIX (") + std::to_string(state.satellites) + " Sats)");
+  }
+  lines.push_back(std::string("Time: ") + (state.time_utc.empty() ? "Wait..." : state.time_utc));
+  lines.push_back(std::string("Grid: ") + (state.grid_square.empty() ? "----" : state.grid_square));
+  char loc[64];
+  snprintf(loc, sizeof(loc), "L: %.3f, %.3f", state.latitude, state.longitude);
+  lines.push_back(loc);
+  if (state.last_rx_ms > 0) {
+    uint32_t diff = (xTaskGetTickCount() * portTICK_PERIOD_MS - state.last_rx_ms) / 1000;
+    lines.push_back(std::string("Sync: Good (") + std::to_string(diff) + "s ago)");
+  } else {
+    lines.push_back("Sync: Pending...");
+  }
+  
+  const int line_h = 19;
+  const int start_y = 18 + 3 + 3;
+
+  M5.Display.startWrite();
+  M5.Display.setTextSize(2);
+  for (size_t i = 0; i < 6; ++i) {
+    std::string text = (i < lines.size()) ? lines[i] : "";
+    if (force_redraw || text != s_last_gps_lines[i]) {
+      s_last_gps_lines[i] = text;
+      int y = start_y + i * line_h;
+      M5.Display.fillRect(0, y, 240, line_h, TFT_BLACK);
+      if (!text.empty()) {
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.setCursor(0, y);
+        M5.Display.printf("%s", text.c_str());
+      }
+    }
+  }
+  M5.Display.endWrite();
+}
+
 static void draw_status_view() {
   std::string lines[6];
   BeaconMode disp_beacon = (ui_mode == UIMode::STATUS) ? g_status_beacon_temp : g_beacon;
@@ -3810,6 +3862,7 @@ static const char* ble_page_label(UIMode mode) {
     case UIMode::DEBUG: return "DELETE";
     case UIMode::STATUS: return "STATUS";
     case UIMode::QSO: return "QSO";
+    case UIMode::GPS: return "GPS";
   }
   return "PAGE";
 }
@@ -4843,6 +4896,9 @@ static void enter_mode(UIMode new_mode) {
       status_cursor_pos = -1;
       draw_status_view();
       break;
+    case UIMode::GPS:
+      draw_gps_view(true);
+      break;
   }
 }
 
@@ -5440,11 +5496,13 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       }
       else if (c == 'd' || c == 'D') { cancel_status_edit(); enter_mode(ui_mode == UIMode::DEBUG ? UIMode::RX : UIMode::DEBUG); switched = true; }
       else if (c == 's' || c == 'S') { cancel_status_edit(); enter_mode(ui_mode == UIMode::STATUS ? UIMode::RX : UIMode::STATUS); switched = true; }
+      else if (c == 'g' || c == 'G') { cancel_status_edit(); enter_mode(ui_mode == UIMode::GPS ? UIMode::RX : UIMode::GPS); switched = true; }
     }
 
   if (!switched && c) {
     // Mode-specific handling
     switch (ui_mode) {
+      case UIMode::GPS: break;
       case UIMode::RX: {
         int sel = ui_handle_rx_key(c);
         RxDecodeEntry tapped;

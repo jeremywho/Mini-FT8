@@ -33,6 +33,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 | `R` | RX | View decoded messages and tap one to start a QSO. |
 | `T` | TX Queue | View and manage the transmit queue. |
 | `S` | STATUS | Access beacon, connect/sync, band step, tune, and date/time functions. |
+| `G` | GPS | View GPS telemetry and synchronization status. |
 | `M` | MENU P1 | Configure core station and operator settings. |
 | `N` | MENU P2 | Configure radio, input, and comment settings. |
 | `O` | MENU P3 | Configure logging, active bands, RTC, copy-to-SD, and retry settings. |
@@ -44,7 +45,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 
 ## Global Keys and Navigation
 
-- `R` / `T` / `B` / `S` / `Q` / `F` / `D` / `C`: switch to the selected mode. Press the same mode key again to return to `RX`.
+- `R` / `T` / `B` / `S` / `G` / `Q` / `F` / `D` / `C`: switch to the selected mode. Press the same mode key again to return to `RX`.
 - `M` / `N` / `O`: jump to MENU page 1 / 2 / 3. Press the current page key again to return to `RX`.
 - `` ` ``: cancel TX globally in `RX`, `TX`, and `STATUS` when not editing.
 - `▲` / `▼`: page up / page down in `RX`, `TX`, `BAND`, `MENU`, `QSO`, `Fetch`, and `Delete`.
@@ -88,6 +89,7 @@ Notes:
 | `T` (TX Queue) | `1` | Rotate the queue to the next same-parity entry. |
 |  | `2..6` | Drop the queue item on the current page. |
 |  | `` ` `` | Cancel TX immediately. |
+| `G` (GPS) |  | View live GPS telemetry including 3D fix, satellites, UTC time, grid square, and last synchronization age. |
 | `S` (STATUS) | `1` | Cycle Beacon mode. Applies when leaving STATUS mode. |
 |  | `2` | Run connect/sync now; starts audio and follows the CAT sync path. |
 |  | `3` | Step to the next active band. Applies after key 2 is pressed or when leaving STATUS. |
