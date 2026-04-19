@@ -175,6 +175,10 @@ static void push_waterfall_latest(const monitor_t& mon) {
 
     // Feed the full-resolution (collapsed) row to the functional core.
     // Stubbed swr/pwr/ptt until real polling lands (see NATIVE_CLIENT_ARCHITECTURE.md).
+    static int wf_log_counter = 0;
+    if ((wf_log_counter++ % 60) == 0) {   // one log every ~10s at 6Hz
+        ESP_LOGI(TAG, "push_waterfall_latest: block=%d num_bins=%d", block, num_bins);
+    }
     core_fire_waterfall_row(block, collapsed, num_bins,
                             /*swr=*/1.5f, /*pwr=*/2.0f, /*ptt=*/false);
 }
@@ -537,10 +541,22 @@ static void uac_lib_task(void* arg) {
 
                     // Start the audio processing task
                     if (s_stream_task_handle == NULL) {
-                        xTaskCreatePinnedToCore(stream_uac_task, "stream_uac",
+                        size_t free_before = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+                        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+                        ESP_LOGI(TAG, "Pre-task-create heap: free=%u largest=%u",
+                                 (unsigned)free_before, (unsigned)largest);
+                        BaseType_t ok = xTaskCreatePinnedToCore(stream_uac_task, "stream_uac",
                                                 STREAM_TASK_STACK_SIZE, NULL,
                                                 UAC_STREAM_TASK_PRIORITY,
                                                 &s_stream_task_handle, 1);
+                        if (ok != pdPASS) {
+                            ESP_LOGE(TAG, "stream_uac_task create FAILED (rc=%d) — "
+                                     "not enough heap for %u-byte stack. "
+                                     "free=%u largest=%u",
+                                     (int)ok, (unsigned)STREAM_TASK_STACK_SIZE,
+                                     (unsigned)free_before, (unsigned)largest);
+                            s_stream_task_handle = NULL;
+                        }
                     }
 
                 } else if (evt.driver.event == UAC_HOST_DRIVER_EVENT_TX_CONNECTED) {

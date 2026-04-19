@@ -707,8 +707,10 @@ static void tx_task_main(void*) {
 bool ble_native_init(void) {
   if (s_tx_task) return true;  // already initialized
 
-  s_rpc_req_queue  = xQueueCreate(8,  sizeof(RpcMsg));
-  s_rpc_resp_queue = xQueueCreate(16, sizeof(RpcMsg));
+  // Small queues — RPC traffic is human-paced, 4 in-flight is plenty.
+  // Each RpcMsg is 258 bytes, so depth × size is the heap cost.
+  s_rpc_req_queue  = xQueueCreate(4, sizeof(RpcMsg));   // ~1 KB
+  s_rpc_resp_queue = xQueueCreate(4, sizeof(RpcMsg));   // ~1 KB
   if (!s_rpc_req_queue || !s_rpc_resp_queue) {
     ESP_LOGE(TAG, "queue create failed");
     return false;
@@ -727,7 +729,9 @@ bool ble_native_init(void) {
   // Priority 3 (below app_task_core0's 5) so the local UI never gets
   // starved by BLE TX work. Pinned to core 1 so it runs alongside the
   // audio task but doesn't contend with the main UI loop on core 0.
-  BaseType_t ok = xTaskCreatePinnedToCore(tx_task_main, "ble_native", 4096,
+  // 3 KB stack is plenty — the task body does shallow JSON building
+  // and fixed-size notifications, no deep recursion or large locals.
+  BaseType_t ok = xTaskCreatePinnedToCore(tx_task_main, "ble_native", 3072,
                                           nullptr, 3, &s_tx_task, 1);
   if (ok != pdPASS) {
     ESP_LOGE(TAG, "tx task create failed");
