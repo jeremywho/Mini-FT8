@@ -54,6 +54,8 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 
 ### BLE Terminal
 
+ You can operate Mini-FT8 entirely from Bluetooth(BLE)
+ 
  Tested: App Store: BLE Terminal HM-10 by Gopi Gadhiya
  
 - `E`: cancel current TX 
