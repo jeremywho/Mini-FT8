@@ -76,16 +76,24 @@ static volatile bool s_evt_dirty_rx     = false;
 static volatile bool s_evt_dirty_qso    = false;
 static volatile bool s_evt_dirty_config = false;
 
-// Latest waterfall row (callback overwrites; TX task sends whenever ready).
-// Only the single most recent row is kept — older rows are dropped (lossy).
+// Latest waterfall row — zero-copy: we store a pointer into the monitor's
+// waterfall buffer (mon.wf.mag) instead of copying 433 bytes. That memory
+// is stable until the next slot boundary (each block writes to a distinct
+// offset), so the TX task can read from it directly.
+//
+// Race window: across a slot boundary, the audio task reuses the same
+// offsets for the new slot's blocks. If the TX task happens to read
+// during that transition (160 ms at 6 Hz × 93 blocks = tiny window at
+// block 0 of the new slot), it may see torn data in one row. For a lossy
+// waterfall stream this is acceptable — one noisy frame.
 struct WaterfallSlot {
-  volatile bool valid = false;
-  int           sym   = 0;
-  int           num_bins = 0;
-  uint8_t       mag[512] = {};    // max bins at our config is ~433
-  float         swr   = 1.5f;
-  float         pwr   = 2.0f;
-  bool          ptt   = false;
+  volatile bool  valid    = false;
+  int            sym      = 0;
+  int            num_bins = 0;
+  const uint8_t* mag_ptr  = nullptr;  // borrowed pointer, not owned
+  float          swr      = 1.5f;
+  float          pwr      = 2.0f;
+  bool           ptt      = false;
 };
 static WaterfallSlot s_wf_slot;
 
@@ -129,18 +137,17 @@ static void on_qso_changed()    { s_evt_dirty_qso    = true; wake_tx_task(); }
 static void on_config_changed() { s_evt_dirty_config = true; wake_tx_task(); }
 
 static void on_waterfall_row(const WaterfallRow& row) {
-  // Keep only the most recent; drop older if TX task is behind.
-  s_wf_slot.valid    = false;          // invalidate while copying
+  // Zero-copy: stash the pointer instead of copying bytes. Valid until
+  // the next slot boundary on the audio task. Worst case a torn read
+  // during slot rollover — acceptable for a lossy stream.
+  s_wf_slot.valid    = false;          // invalidate while storing
   s_wf_slot.sym      = row.sym;
   s_wf_slot.swr      = row.swr;
   s_wf_slot.pwr      = row.pwr;
   s_wf_slot.ptt      = row.ptt;
   s_wf_slot.num_bins = row.mag ? row.num_bins : 0;
-  if (row.mag && row.num_bins > 0 &&
-      (size_t)row.num_bins <= sizeof(s_wf_slot.mag)) {
-    memcpy(s_wf_slot.mag, row.mag, row.num_bins);
-  }
-  s_wf_slot.valid = true;
+  s_wf_slot.mag_ptr  = row.mag;
+  s_wf_slot.valid    = true;
   wake_tx_task();
 }
 
@@ -441,32 +448,38 @@ static void send_waterfall_row() {
   if (!s_sub_radio || !s_wf_slot.valid) return;
   s_wf_slot.valid = false;  // consume
 
-  const int num_bins = s_wf_slot.ptt ? 0 : s_wf_slot.num_bins;
-  const size_t total = BLE_NATIVE_RADIO_STREAM_HEADER_SIZE + (size_t)num_bins;
+  // Snapshot the borrowed pointer + metadata. Even if the audio task
+  // updates s_wf_slot below, we've already captured what we need.
+  const uint8_t* const mag   = s_wf_slot.mag_ptr;
+  const int            bins  = s_wf_slot.ptt ? 0 : s_wf_slot.num_bins;
+  const uint16_t       sym   = (uint16_t)s_wf_slot.sym;
+  const uint16_t       swr_q = (uint16_t)(s_wf_slot.swr * 256.0f);
+  const uint16_t       pwr_q = (uint16_t)(s_wf_slot.pwr * 256.0f);
+  const uint8_t        ptt   = s_wf_slot.ptt ? 1 : 0;
 
-  // If MTU can't fit the whole row, truncate (client still gets header + a prefix).
+  const size_t total = BLE_NATIVE_RADIO_STREAM_HEADER_SIZE + (size_t)bins;
   const size_t max_payload = (s_mtu > 3) ? (size_t)(s_mtu - 3) : 0;
   const size_t send_len = total > max_payload ? max_payload : total;
   if (send_len < BLE_NATIVE_RADIO_STREAM_HEADER_SIZE) return;
 
-  // Static — only the single TX task calls this, no re-entrancy.
-  // Kept off the stack to leave headroom for NimBLE's notify path
-  // (ble_gatts_notify_custom builds a PDU using substantial stack).
-  static uint8_t buf[600];
-  if (send_len > sizeof(buf)) return;
-
+  // Static header-only scratch. Body goes directly from mag pointer
+  // into the mbuf via a second append — no 600-byte intermediate.
   BleRadioStreamHeader hdr;
-  hdr.sym      = (uint16_t)s_wf_slot.sym;
-  hdr.swr_q8   = (uint16_t)(s_wf_slot.swr * 256.0f);
-  hdr.pwr_q8   = (uint16_t)(s_wf_slot.pwr * 256.0f);
-  hdr.ptt      = s_wf_slot.ptt ? 1 : 0;
-  hdr.reserved = 0;
-  memcpy(buf, &hdr, sizeof(hdr));
+  hdr.sym = sym; hdr.swr_q8 = swr_q; hdr.pwr_q8 = pwr_q;
+  hdr.ptt = ptt; hdr.reserved = 0;
 
+  if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_h_radio_stream == 0) return;
+
+  struct os_mbuf* om = ble_hs_mbuf_from_flat(&hdr, sizeof(hdr));
+  if (!om) return;
   const size_t body_len = send_len - sizeof(hdr);
-  if (body_len > 0) memcpy(buf + sizeof(hdr), s_wf_slot.mag, body_len);
-
-  send_notify(s_h_radio_stream, buf, send_len);
+  if (body_len > 0 && mag) {
+    if (os_mbuf_append(om, mag, body_len) != 0) {
+      os_mbuf_free_chain(om);
+      return;
+    }
+  }
+  ble_gatts_notify_custom(s_conn_handle, s_h_radio_stream, om);
 }
 
 // ---------------------------------------------------------------------------

@@ -135,7 +135,15 @@ static const char* profile_name(uac_stream_profile_t profile) {
     }
 }
 
-// Push waterfall row (same as stream_wav.cpp)
+// Push waterfall row — zero-copy at freq_osr=1 (our current config).
+// `base` points into mon.wf.mag for the most recently written block's
+// data. That memory is stable until the next slot boundary (other blocks
+// write to different offsets), so downstream consumers (UI scaling here,
+// ble_native elsewhere) can read from it safely without us copying.
+//
+// At freq_osr>1 we still need a scratch buffer to merge the multiple
+// frequency-sub bands into one row — but since we're at freq_osr=1, no
+// static or stack buffer is allocated here in practice.
 static void push_waterfall_latest(const monitor_t& mon) {
     if (mon.wf.num_blocks <= 0 || mon.wf.mag == nullptr) return;
     const int block = mon.wf.num_blocks - 1;
@@ -143,15 +151,22 @@ static void push_waterfall_latest(const monitor_t& mon) {
     const int freq_osr = mon.wf.freq_osr;
     const uint8_t* base = mon.wf.mag + block * mon.wf.block_stride;
 
-    static uint8_t collapsed[480];  // max num_bins
-    memset(collapsed, 0, num_bins);
-    for (int b = 0; b < num_bins; ++b) {
-        uint8_t v = 0;
-        for (int fs = 0; fs < freq_osr; ++fs) {
-            uint8_t val = base[fs * num_bins + b];
-            if (val > v) v = val;
+    const uint8_t* row_bins;     // pointer to `num_bins` bytes, one per FFT bin
+    if (freq_osr <= 1) {
+        row_bins = base;          // already single-band, zero-copy
+    } else {
+        // Rare path (not used in current 6 kHz config). Keep the merge
+        // buffer function-local so freq_osr=1 doesn't pay for BSS.
+        static uint8_t collapsed[480];
+        for (int b = 0; b < num_bins; ++b) {
+            uint8_t v = 0;
+            for (int fs = 0; fs < freq_osr; ++fs) {
+                uint8_t val = base[fs * num_bins + b];
+                if (val > v) v = val;
+            }
+            collapsed[b] = v;
         }
-        collapsed[b] = v;
+        row_bins = collapsed;
     }
 
     constexpr int width = UAC_WATERFALL_ROW_WIDTH;
@@ -162,7 +177,7 @@ static void push_waterfall_latest(const monitor_t& mon) {
         if (end <= start) end = start + 1;
         uint8_t maxv = 0;
         for (int s = start; s < end && s < num_bins; ++s) {
-            if (collapsed[s] > maxv) maxv = collapsed[s];
+            if (row_bins[s] > maxv) maxv = row_bins[s];
         }
         scaled[x] = maxv;
     }
@@ -173,13 +188,15 @@ static void push_waterfall_latest(const monitor_t& mon) {
     s_latest_waterfall_row_valid = true;
     taskEXIT_CRITICAL(&s_latest_waterfall_row_lock);
 
-    // Feed the full-resolution (collapsed) row to the functional core.
-    // Stubbed swr/pwr/ptt until real polling lands (see NATIVE_CLIENT_ARCHITECTURE.md).
+    // Stubbed swr/pwr/ptt until real polling lands (see
+    // NATIVE_CLIENT_ARCHITECTURE.md). row_bins points into mon.wf.mag
+    // (zero-copy) so the callback receives a pointer into authoritative
+    // waterfall storage — valid until the next slot boundary.
     static int wf_log_counter = 0;
-    if ((wf_log_counter++ % 60) == 0) {   // one log every ~10s at 6Hz
+    if ((wf_log_counter++ % 60) == 0) {
         ESP_LOGI(TAG, "push_waterfall_latest: block=%d num_bins=%d", block, num_bins);
     }
-    core_fire_waterfall_row(block, collapsed, num_bins,
+    core_fire_waterfall_row(block, row_bins, num_bins,
                             /*swr=*/1.5f, /*pwr=*/2.0f, /*ptt=*/false);
 }
 
