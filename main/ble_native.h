@@ -101,7 +101,12 @@
 #define BLE_NATIVE_RPC_ADIF_CLOSE      "adif_close"
 
 // ---------------------------------------------------------------------------
-// RADIO_STREAM packet (binary, little-endian, one notification per row).
+// RADIO_STREAM packet (binary, little-endian).
+//
+// One waterfall row may be split across multiple notifications when the row
+// would otherwise exceed the negotiated MTU (e.g. on iOS where MTU often
+// caps at 247 and a 433-bin row needs 441 bytes). Each notification is a
+// "chunk" with a small header that lets the client reassemble the row.
 //
 //   offset  size  field       meaning
 //   ------  ----  ----------  --------------------------------------------
@@ -109,12 +114,17 @@
 //   2       2     swr_q8      SWR × 256, little-endian uint16
 //   4       2     pwr_q8      Watts × 256, little-endian uint16
 //   6       1     ptt         0 = RX, 1 = TX
-//   7       1     reserved    0
-//   8       N     mag[N]      waterfall magnitudes (N bins, 1 byte each)
-//                             N = (total_payload_bytes - 8). N == 0 when ptt=1.
+//   7       1     chunk_info  bits 0..3: chunk_idx (0..chunk_count-1)
+//                             bits 4..7: chunk_count (1..15)
+//   8       N     mag[N]      waterfall magnitudes for this chunk only
+//                             N = (total_payload_bytes - 8). N == 0 when
+//                             ptt=1 (PTT frames are always single-chunk).
 //
-// The client reconstructs the row from these bytes; no JSON/base64 overhead.
-// At 433 bins + 8-byte header = 441 bytes per row, fits in MTU 500.
+// Reassembly: the client buffers chunks until chunk_idx == chunk_count-1,
+// then the concatenated mag[] across all chunks is the full waterfall row
+// covering 200..2900 Hz (433 bins at the firmware's current config).
+// Drop-tolerant: a missing chunk causes the in-progress row to be discarded
+// when the next chunk_idx==0 arrives — same blast radius as one lost row.
 // ---------------------------------------------------------------------------
 
 #define BLE_NATIVE_RADIO_STREAM_HEADER_SIZE 8
@@ -124,7 +134,7 @@ struct BleRadioStreamHeader {
   uint16_t swr_q8;
   uint16_t pwr_q8;
   uint8_t  ptt;
-  uint8_t  reserved;
+  uint8_t  chunk_info;   // (chunk_count << 4) | chunk_idx
 } __attribute__((packed));
 static_assert(sizeof(BleRadioStreamHeader) == BLE_NATIVE_RADIO_STREAM_HEADER_SIZE,
               "BleRadioStreamHeader packed size mismatch");

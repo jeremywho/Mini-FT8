@@ -457,29 +457,52 @@ static void send_waterfall_row() {
   const uint16_t       pwr_q = (uint16_t)(s_wf_slot.pwr * 256.0f);
   const uint8_t        ptt   = s_wf_slot.ptt ? 1 : 0;
 
-  const size_t total = BLE_NATIVE_RADIO_STREAM_HEADER_SIZE + (size_t)bins;
-  const size_t max_payload = (s_mtu > 3) ? (size_t)(s_mtu - 3) : 0;
-  const size_t send_len = total > max_payload ? max_payload : total;
-  if (send_len < BLE_NATIVE_RADIO_STREAM_HEADER_SIZE) return;
-
-  // Static header-only scratch. Body goes directly from mag pointer
-  // into the mbuf via a second append — no 600-byte intermediate.
-  BleRadioStreamHeader hdr;
-  hdr.sym = sym; hdr.swr_q8 = swr_q; hdr.pwr_q8 = pwr_q;
-  hdr.ptt = ptt; hdr.reserved = 0;
-
   if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_h_radio_stream == 0) return;
 
-  struct os_mbuf* om = ble_hs_mbuf_from_flat(&hdr, sizeof(hdr));
-  if (!om) return;
-  const size_t body_len = send_len - sizeof(hdr);
-  if (body_len > 0 && mag) {
-    if (os_mbuf_append(om, mag, body_len) != 0) {
-      os_mbuf_free_chain(om);
-      return;
-    }
+  const size_t header_sz   = BLE_NATIVE_RADIO_STREAM_HEADER_SIZE;
+  const size_t max_payload = (s_mtu > 3) ? (size_t)(s_mtu - 3) : 0;
+  if (max_payload <= header_sz) return;
+  const int max_bins_per_chunk = (int)(max_payload - header_sz);
+
+  // Compute chunking: split the 433-bin row across chunk_count notifications
+  // when it can't fit in one MTU. PTT frames carry no magnitudes but still
+  // emit one header-only chunk so chunk_count is always >= 1.
+  int chunk_count;
+  int chunk_size;
+  if (bins <= 0 || !mag) {
+    chunk_count = 1;
+    chunk_size  = 0;
+  } else {
+    chunk_count = (bins + max_bins_per_chunk - 1) / max_bins_per_chunk;
+    if (chunk_count > 15) chunk_count = 15;   // chunk_info field is 4 bits
+    chunk_size = (bins + chunk_count - 1) / chunk_count;
   }
-  ble_gatts_notify_custom(s_conn_handle, s_h_radio_stream, om);
+
+  // Each chunk's body is a pointer into mon.wf.mag — true zero-copy,
+  // no scratch buffer.
+  for (int c = 0; c < chunk_count; ++c) {
+    const int bin_offset = c * chunk_size;
+    int this_bins = (bins > 0) ? chunk_size : 0;
+    if (bin_offset + this_bins > bins) this_bins = bins - bin_offset;
+    if (this_bins < 0) this_bins = 0;
+
+    BleRadioStreamHeader hdr;
+    hdr.sym       = sym;
+    hdr.swr_q8    = swr_q;
+    hdr.pwr_q8    = pwr_q;
+    hdr.ptt       = ptt;
+    hdr.chunk_info = (uint8_t)(((chunk_count & 0x0F) << 4) | (c & 0x0F));
+
+    struct os_mbuf* om = ble_hs_mbuf_from_flat(&hdr, sizeof(hdr));
+    if (!om) return;
+    if (this_bins > 0) {
+      if (os_mbuf_append(om, mag + bin_offset, (size_t)this_bins) != 0) {
+        os_mbuf_free_chain(om);
+        return;
+      }
+    }
+    ble_gatts_notify_custom(s_conn_handle, s_h_radio_stream, om);
+  }
 }
 
 // ---------------------------------------------------------------------------
