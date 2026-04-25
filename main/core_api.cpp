@@ -338,6 +338,14 @@ bool apply_config_write(T&& mutator) {
 }
 }  // namespace
 
+// Globals owned by main.cpp. Arming them here makes a user-pick take
+// effect at the very next slot boundary; without this the autoseq tick
+// only picks the new TX up on its next pass — typically 1-2 slots later.
+extern volatile bool   g_qso_xmit;
+extern volatile int    g_target_slot_parity;
+extern AutoseqTxEntry  g_pending_tx;
+extern bool            g_pending_tx_valid;
+
 bool core_cmd_tap_rx(int rx_list_idx) {
   RxDecodeEntry entry{};
   if (!ui_get_rx_entry(rx_list_idx, &entry)) return false;
@@ -354,6 +362,18 @@ bool core_cmd_tap_rx(int rx_list_idx) {
   msg.is_cq     = entry.is_cq;
   msg.is_to_me  = entry.is_to_me;
   autoseq_on_touch(msg);
+
+  // Arm the TX state machine for the next matching slot boundary so the
+  // user's pick is honoured immediately instead of waiting for the next
+  // autoseq tick to pull in the pending TX (which would delay by 1-2
+  // slots). Mirrors what the Cardputer RX-key handler used to do inline.
+  AutoseqTxEntry pending{};
+  if (autoseq_fetch_pending_tx(pending)) {
+    g_qso_xmit           = true;
+    g_target_slot_parity = pending.slot_id & 1;
+    g_pending_tx         = pending;
+    g_pending_tx_valid   = true;
+  }
   core_fire_qso_changed();
   return true;
 }

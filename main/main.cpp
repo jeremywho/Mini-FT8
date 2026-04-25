@@ -970,8 +970,11 @@ volatile bool g_cdc_initial_sync_pending = false;
 
 // State machine variables (matching reference project architecture)
 // TX is scheduled by setting these flags; actual TX starts at slot boundary
-static volatile bool g_qso_xmit = false;        // TX is pending
-static volatile int g_target_slot_parity = 0;   // 0=even, 1=odd - parity of slot to TX on
+// Global TX-arming state: read by tx_tick on the next slot boundary.
+// Non-static so core_api.cpp can arm it from the BLE tap_rx RPC, matching
+// what the Cardputer's RX-key handler does inline.
+volatile bool g_qso_xmit = false;        // TX is pending
+volatile int g_target_slot_parity = 0;   // 0=even, 1=odd - parity of slot to TX on
 static volatile bool g_was_txing = false;       // We were transmitting (for tick timing)
 volatile bool g_decode_in_progress = false; // Block TX trigger while decoding
 static int g_last_slot_parity = -1;             // For slot boundary detection (just parity, like reference)
@@ -1015,8 +1018,10 @@ static UIMode g_ble_qso_return_mode = UIMode::RX;
 static void host_handle_line(const std::string& line);
 void save_station_data();  // visible to core_api.cpp
 // TX entry for display and scheduling (populated by autoseq)
-static AutoseqTxEntry g_pending_tx;
-static bool g_pending_tx_valid = false;
+// Non-static for the same reason as g_qso_xmit / g_target_slot_parity
+// above — core_api.cpp's tap_rx RPC arms these on user-pick events.
+AutoseqTxEntry g_pending_tx;
+bool g_pending_tx_valid = false;
 volatile bool g_tx_cancel_requested = false;   // visible to core_api.cpp
 static void host_process_bytes(const uint8_t* buf, size_t len);
 static void poll_host_uart();
@@ -5624,14 +5629,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       case UIMode::RX: {
         int sel = ui_handle_rx_key(c);
         if (sel >= 0 && core_cmd_tap_rx(sel)) {
-          // Arm the TX state machine for the next slot boundary.
-          AutoseqTxEntry pending;
-          if (autoseq_fetch_pending_tx(pending)) {
-            g_qso_xmit = true;
-            g_target_slot_parity = pending.slot_id & 1;
-            g_pending_tx = pending;
-            g_pending_tx_valid = true;
-          }
+          // TX-state arming now lives inside core_cmd_tap_rx so both the
+          // Cardputer key path and the BLE tap_rx RPC arm immediately.
           rx_flash_idx = sel;
           rx_flash_deadline = rtc_now_ms() + 500;
           ui_draw_rx(rx_flash_idx);
