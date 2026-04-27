@@ -20,3 +20,5 @@ dependencies:
   espressif/usb: '*'
   # USB Host CDC for CAT
   espressif/usb_host_cdc_acm: ^2.2.0
+  # Cardputer-Adv ES8311 mic capture
+  espressif/esp_codec_dev: ^1.5.9

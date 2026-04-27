@@ -35,7 +35,7 @@ struct RxDecodeEntry {
     bool is_to_me;
 };
 
-void ui_init();
+void ui_init(bool display_only = false);
 void ui_set_waterfall_row(int row, const uint8_t* bins, int len);
 // Push a new row into the waterfall ring buffer (advances head). UI task must flush.
 void ui_push_waterfall_row(const uint8_t* bins, int len);

@@ -113,6 +113,7 @@ public:
     }
 
     void begin();
+    void beginCardputerADV();
     void begin(std::unique_ptr<KeyboardReader> reader);
     uint8_t getKey(Point2D_t keyCoor);
 

@@ -6,8 +6,9 @@
 #include "TCA8418.h"
 #include "../../common.h"
 #include "../../Adafruit_TCA8418/Adafruit_TCA8418_registers.h"
-#include <Arduino.h>
-#include <M5Unified.h>
+#include "driver/gpio.h"
+#include "esp_err.h"
+#include <algorithm>
 
 // Default interrupt pin for M5Cardputer ADV
 #define DEFAULT_TCA8418_INT_PIN 11
@@ -41,8 +42,22 @@ void TCA8418KeyboardReader::begin()
 
     // Setup interrupt pin
     if (_interrupt_pin >= 0) {
-        pinMode(_interrupt_pin, INPUT);
-        attachInterruptArg(digitalPinToInterrupt(_interrupt_pin), gpio_isr_handler, this, CHANGE);
+        gpio_config_t io_conf = {};
+        io_conf.intr_type = GPIO_INTR_ANYEDGE;
+        io_conf.mode = GPIO_MODE_INPUT;
+        io_conf.pin_bit_mask = 1ULL << _interrupt_pin;
+        io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+        gpio_config(&io_conf);
+
+        static bool isr_installed = false;
+        if (!isr_installed) {
+            esp_err_t err = gpio_install_isr_service(0);
+            if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
+                isr_installed = true;
+            }
+        }
+        gpio_isr_handler_add((gpio_num_t)_interrupt_pin, gpio_isr_handler, this);
     }
 
     // Enable interrupts

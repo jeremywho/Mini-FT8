@@ -15,6 +15,7 @@ class M5_CARDPUTER {
 public:
     void begin(bool enableKeyboard = true);
     void begin(m5::M5Unified::config_t cfg, bool enableKeyboard = true);
+    void beginDisplayOnly(bool enableKeyboard = true);
 
     M5GFX &Display         = M5.Display;
     M5GFX &Lcd             = Display;
@@ -35,7 +36,8 @@ public:
 
 private:
     /* data */
-    bool _enableKeyboard;
+    bool _enableKeyboard = false;
+    bool _displayOnly = false;
 };
 
 }  // namespace m5

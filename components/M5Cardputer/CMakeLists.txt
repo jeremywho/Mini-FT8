@@ -17,4 +17,5 @@ idf_component_register(
     REQUIRES
         M5Unified
         M5GFX
+        board_cardputer_adv
 )

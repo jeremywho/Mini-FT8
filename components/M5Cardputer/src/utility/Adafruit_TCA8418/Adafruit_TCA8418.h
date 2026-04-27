@@ -22,7 +22,8 @@
 // #include <Adafruit_I2CDevice.h>
 // #include <Adafruit_I2CRegister.h>
 #include "Adafruit_TCA8418_registers.h"
-#include <M5Unified.hpp>
+#include "driver/i2c_master.h"
+#include <cstdint>
 #include <functional>
 
 #define TCA8418_DEFAULT_ADDR 0x34  ///< The default I2C address for our breakout
@@ -69,10 +70,9 @@ enum {
  *    @brief  Class that stores state and functions for interacting with
  *            the TCA8418 I2C GPIO expander
  */
-class Adafruit_TCA8418 : public m5::I2C_Device {
+class Adafruit_TCA8418 {
 public:
-    Adafruit_TCA8418(std::uint8_t i2c_addr = TCA8418_DEFAULT_ADDR, std::uint32_t freq = 400000,
-                     m5::I2C_Class* i2c = &m5::In_I2C);
+    Adafruit_TCA8418(std::uint8_t i2c_addr = TCA8418_DEFAULT_ADDR, std::uint32_t freq = 400000);
 
     // Adafruit_TCA8418();
     ~Adafruit_TCA8418();
@@ -114,12 +114,15 @@ public:
     void enableDebounce();
     void disableDebounce();
 
-    // // for expert mode
-    // uint8_t readRegister(uint8_t reg);
-    // void writeRegister(uint8_t reg, uint8_t value);
+    uint8_t readRegister8(uint8_t reg);
+    bool writeRegister8(uint8_t reg, uint8_t value);
 
-    // protected:
-    //     Adafruit_I2CDevice* i2c_dev = NULL; ///< Pointer to I2C bus interface
+private:
+    bool ensureDevice();
+
+    uint8_t _addr = TCA8418_DEFAULT_ADDR;
+    uint32_t _freq = 400000;
+    i2c_master_dev_handle_t _dev_handle = nullptr;
 };
 
 #endif

@@ -1,187 +1,231 @@
 #include "stream_mic.h"
-#include "esp_log.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "ui.h"
-#include "mic_input.h"
-#include <vector>
+
 #include <cmath>
 #include <cstring>
 
-extern "C" {
-  #include "ft8/decode.h"
-  #include "ft8/constants.h"
-  #include "common/monitor.h"
+#include "board_audio.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "ft8_audio_pipeline.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "resample.h"
+
+static const char* TAG = "KH1_MIC";
+
+static constexpr int MIC_SAMPLE_RATE = 48000;
+static constexpr int MIC_BITS_PER_SAMPLE = 16;
+static constexpr int MIC_CHANNELS = 1;
+static constexpr float MIC_GAIN_DB = 30.0f;
+static constexpr int MIC_FRAME_SAMPLES = 480;
+static constexpr int MIC_DECIM_FACTOR = 8;
+
+static TaskHandle_t s_task_handle = nullptr;
+static volatile bool s_stop_requested = false;
+static bool s_started = false;
+static bool s_streaming = false;
+static char s_status_string[64] = "Idle";
+static char s_debug_line1[64] = "";
+static char s_debug_line2[64] = "";
+
+extern bool g_streaming;
+
+typedef struct {
+    int16_t* pcm;
+    resample_state_t resample;
+    uint32_t frame;
+} mic_reader_ctx_t;
+
+static bool mic_should_stop(void* ctx)
+{
+    (void)ctx;
+    return s_stop_requested;
 }
 
-static const char* TAG_MIC = "FT8_MIC";
-extern bool g_streaming;  // true when WAV playback is running
-extern int g_time_osr;
-extern int g_freq_osr;
-void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
-int64_t rtc_now_ms();
+static int mic_read_ft8_samples(void* ctx, float* out, int max_samples)
+{
+    mic_reader_ctx_t* mic = (mic_reader_ctx_t*)ctx;
+    if (!mic || !mic->pcm || !out || max_samples <= 0) return 0;
 
-#ifndef FT8_SAMPLE_RATE
-#define FT8_SAMPLE_RATE 6000
-#endif
+    const int input_samples = MIC_FRAME_SAMPLES;
+    const int output_samples = input_samples / MIC_DECIM_FACTOR;
+    if (max_samples < output_samples) return 0;
 
-static void push_waterfall_latest(const monitor_t& mon) {
-  if (mon.wf.num_blocks <= 0 || mon.wf.mag == nullptr) return;
-  const int block = mon.wf.num_blocks - 1;
-  const int num_bins = mon.wf.num_bins;
-  const int freq_osr = mon.wf.freq_osr;
-  const uint8_t* base = mon.wf.mag + block * mon.wf.block_stride;
-
-  static std::vector<uint8_t> collapsed;
-  collapsed.assign(num_bins, 0);
-  for (int b = 0; b < num_bins; ++b) {
-    uint8_t v = 0;
-    for (int fs = 0; fs < freq_osr; ++fs) {
-      uint8_t val = base[fs * num_bins + b];
-      if (val > v) v = val;
+    size_t bytes_read = 0;
+    esp_err_t err = board_audio_read(mic->pcm, input_samples, &bytes_read);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "board_audio_read failed: %s", esp_err_to_name(err));
+        return 0;
     }
-    collapsed[b] = v;
-  }
 
-  constexpr int width = 240;
-  static std::vector<uint8_t> scaled;
-  scaled.assign(width, 0);
-  for (int x = 0; x < width; ++x) {
-    int start = (int)((int64_t)x * num_bins / width);
-    int end = (int)((int64_t)(x + 1) * num_bins / width);
-    if (end <= start) end = start + 1;
-    uint8_t maxv = 0;
-    for (int s = start; s < end && s < num_bins; ++s) {
-      if (collapsed[s] > maxv) maxv = collapsed[s];
+    int frames = (int)(bytes_read / sizeof(int16_t));
+    if (frames <= 0) return 0;
+    int out_count = frames / MIC_DECIM_FACTOR;
+    if (out_count > max_samples) out_count = max_samples;
+
+    int16_t minv = mic->pcm[0];
+    int16_t maxv = mic->pcm[0];
+    int64_t sum_abs = 0;
+    for (int i = 0; i < frames; ++i) {
+        int16_t v = mic->pcm[i];
+        if (v < minv) minv = v;
+        if (v > maxv) maxv = v;
+        sum_abs += std::abs((int)v);
     }
-    scaled[x] = maxv;
-  }
 
-  ui_push_waterfall_row(scaled.data(), width);
+    float mono[MIC_FRAME_SAMPLES];
+    for (int i = 0; i < frames; ++i) {
+        mono[i] = (float)mic->pcm[i] / 32768.0f;
+    }
+    out_count = resample_48k_to_6k(&mic->resample, mono, out, frames);
+    if (out_count > max_samples) out_count = max_samples;
+
+    if ((mic->frame % 25) == 0) {
+        int32_t avg_abs = frames > 0 ? (int32_t)(sum_abs / frames) : 0;
+        ESP_LOGI(TAG, "frame=%lu bytes=%u min=%d max=%d avg_abs=%ld",
+                 (unsigned long)mic->frame, (unsigned)bytes_read,
+                 (int)minv, (int)maxv, (long)avg_abs);
+    }
+
+    snprintf(s_debug_line1, sizeof(s_debug_line1),
+             "KH1-MIC %d/%d/%d", MIC_SAMPLE_RATE, MIC_BITS_PER_SAMPLE, MIC_CHANNELS);
+    snprintf(s_debug_line2, sizeof(s_debug_line2),
+             "rd=%u min=%d max=%d", (unsigned)bytes_read, (int)minv, (int)maxv);
+
+    mic->frame++;
+    return out_count;
 }
 
-void stream_mic_task(void* /*arg*/) {
-  if (mic_input_init() != ESP_OK) {
-    ESP_LOGE(TAG_MIC, "mic init failed");
-    vTaskDelete(nullptr);
-    return;
-  }
+static void mic_stream_task(void* arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "KH1-MIC audio streaming task started");
 
-  monitor_config_t mon_cfg;
-  mon_cfg.f_min = 200.0f;
-  mon_cfg.f_max = 2900.0f;
-  mon_cfg.sample_rate = FT8_SAMPLE_RATE;
-  mon_cfg.time_osr = g_time_osr;
-  mon_cfg.freq_osr = g_freq_osr;
-  mon_cfg.protocol = FTX_PROTOCOL_FT8;
+    board_audio_config_t cfg = {};
+    cfg.sample_rate = MIC_SAMPLE_RATE;
+    cfg.channels = MIC_CHANNELS;
+    cfg.bits_per_sample = MIC_BITS_PER_SAMPLE;
+    cfg.mic_gain_db = MIC_GAIN_DB;
+    cfg.speaker_volume = 80;
 
-  monitor_t mon;
-  monitor_init(&mon, &mon_cfg);
-  monitor_reset(&mon);
-
-  float* chunk = (float*)heap_caps_malloc(sizeof(float) * mon.block_size, MALLOC_CAP_DEFAULT);
-  if (!chunk) {
-    ESP_LOGE(TAG_MIC, "Chunk alloc failed");
-    monitor_free(&mon);
-    vTaskDelete(nullptr);
-    return;
-  }
-
-  const int target_blocks = 80; // 79 symbols ~=12.64s; one-frame margin
-
-  while (true) {
-    if (g_streaming) {
-      mic_input_stop();
-      vTaskDelay(pdMS_TO_TICKS(100));
-      continue;
-    }
-
-    mic_input_start();
-
-    // Wait to slot boundary (00/15/30/45s)
-    {
-      int64_t now_ms = rtc_now_ms();
-      int64_t rem = now_ms % 15000;
-      int64_t wait_ms = (rem < 100) ? 0 : (15000 - rem);
-      if (wait_ms > 0) vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
-    }
-
-    monitor_reset(&mon);
-    TickType_t next_wake = xTaskGetTickCount();
-
-        for (int blk = 0; blk < target_blocks && !g_streaming; ++blk) {
-      if (!mic_input_get_block(chunk, mon.block_size)) {
-        ESP_LOGW(TAG_MIC, "mic read failed");
-        break;
-      }
-      double acc = 0.0;
-      for (int i = 0; i < mon.block_size; ++i) acc += fabsf(chunk[i]);
-      float level = (float)(acc / mon.block_size);
-      float gain = (level > 1e-6f) ? 0.1f / level : 1.0f;
-      if (gain < 0.1f) gain = 0.1f;
-      if (gain > 10.0f) gain = 10.0f;
-      if ((blk % 10) == 0) {
-        ESP_LOGI(TAG_MIC, "blk %d level=%.5f gain=%.2f", blk, level, gain);
-      }
-      for (int i = 0; i < mon.block_size; ++i) {
-        chunk[i] *= gain;
-      }
-
-            // Debug: show raw waveform energy instead of spectrum
-      {
-        const int width = 240;
-        uint8_t row[width];
-        int samples_per_px = mon.block_size / width;
-        if (samples_per_px < 1) samples_per_px = 1;
-        for (int x = 0; x < width; ++x) {
-          int start = x * samples_per_px;
-          int end = start + samples_per_px;
-          if (end > mon.block_size) end = mon.block_size;
-          float acc = 0.0f;
-          for (int i = start; i < end; ++i) acc += fabsf(chunk[i]);
-          float avg = acc / (end - start + 1e-6f);
-          int v = (int)(avg * 4000.0f); // scale roughly to 0-255
-          if (v > 255) v = 255;
-          row[x] = (uint8_t)v;
-        }
-        ui_push_waterfall_row(row, width);
-      }
-
-      monitor_process(&mon, chunk);
-      vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(160));
-    }
-
-    // If WAV streaming started, skip decode and continue
-    if (g_streaming) {
-      mic_input_stop();
-      continue;
-    }
-
-    if (mon.wf.num_blocks > 0) {
-      struct DecodeParam { monitor_t* mon; monitor_config_t cfg; TaskHandle_t waiter; };
-      auto* p = new DecodeParam{&mon, mon_cfg, xTaskGetCurrentTaskHandle()};
-      auto decode_task = [](void* a) {
-        auto* d = static_cast<DecodeParam*>(a);
-        decode_monitor_results(d->mon, &d->cfg, false);
-        xTaskNotifyGive(d->waiter);
-        delete d;
+    esp_err_t err = board_audio_init(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "board_audio_init failed: %s", esp_err_to_name(err));
+        snprintf(s_status_string, sizeof(s_status_string), "Mic init failed");
+        s_streaming = false;
+        s_started = false;
+        g_streaming = false;
+        s_task_handle = nullptr;
         vTaskDelete(nullptr);
-      };
-      if (xTaskCreatePinnedToCore(decode_task, "decode_mic", 8192, p, 4, nullptr, 1) == pdPASS) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-      } else {
-        ESP_LOGE(TAG_MIC, "decode task start failed");
-        delete p;
-      }
+        return;
     }
-  }
 
-  // never reached
-  mic_input_stop();
-  free(chunk);
-  monitor_free(&mon);
-  vTaskDelete(nullptr);
+    int16_t* pcm = (int16_t*)heap_caps_malloc(sizeof(int16_t) * MIC_FRAME_SAMPLES,
+                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!pcm) {
+        ESP_LOGE(TAG, "mic PCM buffer allocation failed");
+        board_audio_deinit();
+        snprintf(s_status_string, sizeof(s_status_string), "Mic alloc failed");
+        s_streaming = false;
+        s_started = false;
+        g_streaming = false;
+        s_task_handle = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    s_streaming = true;
+    g_streaming = true;
+    snprintf(s_status_string, sizeof(s_status_string), "Streaming KH1-MIC 48k/16/1");
+
+    mic_reader_ctx_t reader = {
+        .pcm = pcm,
+        .resample = {},
+        .frame = 0,
+    };
+    resample_init(&reader.resample);
+    ft8_audio_pipeline_config_t pipe_cfg = {
+        .tag = TAG,
+        .ctx = &reader,
+        .read = mic_read_ft8_samples,
+        .should_stop = mic_should_stop,
+        .on_block_processed = nullptr,
+    };
+    ft8_audio_pipeline_run(&pipe_cfg);
+
+    free(pcm);
+    board_audio_deinit();
+    s_streaming = false;
+    s_started = false;
+    g_streaming = false;
+    s_task_handle = nullptr;
+    snprintf(s_status_string, sizeof(s_status_string), "Idle");
+    ESP_LOGI(TAG, "KH1-MIC audio streaming task stopped");
+    vTaskDelete(nullptr);
 }
 
+bool mic_stream_start(void)
+{
+    if (s_started || s_task_handle) {
+        ESP_LOGW(TAG, "KH1-MIC stream already started");
+        return true;
+    }
 
+    s_stop_requested = false;
+    ft8_audio_pipeline_clear_latest_waterfall_row();
+    snprintf(s_status_string, sizeof(s_status_string), "Starting KH1-MIC");
+    BaseType_t ret = xTaskCreatePinnedToCore(mic_stream_task, "stream_mic",
+                                             8192, nullptr, 4, &s_task_handle, 1);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "failed to create KH1-MIC stream task");
+        s_task_handle = nullptr;
+        snprintf(s_status_string, sizeof(s_status_string), "Mic task failed");
+        return false;
+    }
+
+    s_started = true;
+    return true;
+}
+
+void mic_stream_stop(void)
+{
+    if (!s_started && !s_task_handle) return;
+    ESP_LOGI(TAG, "Stopping KH1-MIC audio");
+    s_stop_requested = true;
+    g_streaming = false;
+
+    int timeout = 50;
+    while (s_task_handle && timeout > 0) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        timeout--;
+    }
+
+    if (s_task_handle) {
+        ESP_LOGW(TAG, "KH1-MIC stream task did not stop before timeout");
+        snprintf(s_status_string, sizeof(s_status_string), "Mic stopping");
+    } else {
+        s_started = false;
+        s_streaming = false;
+        snprintf(s_status_string, sizeof(s_status_string), "Idle");
+    }
+}
+
+bool mic_stream_is_streaming(void)
+{
+    return s_streaming;
+}
+
+const char* mic_stream_get_status_string(void)
+{
+    return s_status_string;
+}
+
+const char* mic_stream_get_debug_line1(void)
+{
+    return s_debug_line1;
+}
+
+const char* mic_stream_get_debug_line2(void)
+{
+    return s_debug_line2;
+}

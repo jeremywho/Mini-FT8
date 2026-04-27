@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
+#include "ft8_audio_pipeline.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,7 +33,7 @@ typedef enum {
     UAC_PROFILE_GENERIC_USB = 1, // Generic USB audio + generic CDC scan
 } uac_stream_profile_t;
 
-#define UAC_WATERFALL_ROW_WIDTH 240
+#define UAC_WATERFALL_ROW_WIDTH FT8_AUDIO_WATERFALL_ROW_WIDTH
 
 // Get current UAC streaming state
 uac_stream_state_t uac_get_state(void);

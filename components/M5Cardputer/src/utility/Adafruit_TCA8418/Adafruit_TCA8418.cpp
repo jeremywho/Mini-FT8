@@ -35,12 +35,17 @@
 // #include "Arduino.h"
 
 #include "Adafruit_TCA8418.h"
+#include "board_i2c.h"
+#include "esp_err.h"
+#include "freertos/FreeRTOS.h"
 
 /**
  *    @brief  Instantiates a new TCA8418 class
  */
-Adafruit_TCA8418::Adafruit_TCA8418(std::uint8_t i2c_addr, std::uint32_t freq, m5::I2C_Class* i2c)
-    : I2C_Device(i2c_addr, freq, i2c)
+Adafruit_TCA8418::Adafruit_TCA8418(std::uint8_t i2c_addr, std::uint32_t freq)
+    : _addr(i2c_addr)
+    , _freq(freq)
+    , _dev_handle(nullptr)
 {
 }
 
@@ -397,3 +402,64 @@ void Adafruit_TCA8418::disableDebounce()
 //     Adafruit_I2CRegister i2cReg = Adafruit_I2CRegister(i2c_dev, reg);
 //     i2cReg.write(value);
 // }
+
+bool Adafruit_TCA8418::ensureDevice()
+{
+    if (_dev_handle) {
+        return true;
+    }
+
+    i2c_master_bus_handle_t bus = nullptr;
+    esp_err_t err = board_i2c_get_bus(&bus);
+    if (err != ESP_OK || !bus) {
+        printf("[error] TCA8418: board_i2c_get_bus failed: %s\n", esp_err_to_name(err));
+        return false;
+    }
+
+    i2c_device_config_t dev_cfg = {};
+    dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    dev_cfg.device_address = _addr;
+    dev_cfg.scl_speed_hz = _freq;
+
+    err = i2c_master_bus_add_device(bus, &dev_cfg, &_dev_handle);
+    if (err != ESP_OK) {
+        printf("[error] TCA8418: add device failed: %s\n", esp_err_to_name(err));
+        _dev_handle = nullptr;
+        return false;
+    }
+
+    return true;
+}
+
+uint8_t Adafruit_TCA8418::readRegister8(uint8_t reg)
+{
+    if (!ensureDevice()) {
+        return 0;
+    }
+
+    uint8_t value = 0;
+    esp_err_t err = i2c_master_transmit_receive(_dev_handle, &reg, 1, &value, 1,
+                                                pdMS_TO_TICKS(100));
+    if (err != ESP_OK) {
+        printf("[error] TCA8418: read reg 0x%02x failed: %s\n", reg, esp_err_to_name(err));
+        return 0;
+    }
+
+    return value;
+}
+
+bool Adafruit_TCA8418::writeRegister8(uint8_t reg, uint8_t value)
+{
+    if (!ensureDevice()) {
+        return false;
+    }
+
+    uint8_t data[2] = {reg, value};
+    esp_err_t err = i2c_master_transmit(_dev_handle, data, sizeof(data), pdMS_TO_TICKS(100));
+    if (err != ESP_OK) {
+        printf("[error] TCA8418: write reg 0x%02x failed: %s\n", reg, esp_err_to_name(err));
+        return false;
+    }
+
+    return true;
+}

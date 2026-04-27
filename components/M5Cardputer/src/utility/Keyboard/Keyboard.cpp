@@ -8,7 +8,6 @@
 #include "KeyboardReader/KeyboardReader.h"
 #include "KeyboardReader/IOMatrix.h"
 #include "KeyboardReader/TCA8418.h"
-#include <Arduino.h>
 #include <M5Unified.h>
 #include <memory>
 
@@ -27,6 +26,13 @@ void Keyboard_Class::begin()
         _keyboard_reader = std::make_unique<KeyboardReader>();
     }
 
+    _keyboard_reader->begin();
+}
+
+void Keyboard_Class::beginCardputerADV()
+{
+    _keyboard_reader.reset();
+    _keyboard_reader = std::make_unique<TCA8418KeyboardReader>();
     _keyboard_reader->begin();
 }
 

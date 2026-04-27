@@ -1,4 +1,5 @@
 #include "stream_uac.h"
+#include "ft8_audio_pipeline.h"
 #include "resample.h"
 
 #include "freertos/FreeRTOS.h"
@@ -7,18 +8,12 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "usb/usb_host.h"
 #include "usb/uac_host.h"
 #include "usb/cdc_acm_host.h"
 #include "usb/usb_types_ch9.h"
 
-extern "C" {
-#include "ft8/decode.h"
-#include "ft8/constants.h"
-#include "common/monitor.h"
-}
-
-#include "ui.h"
 #include <cstring>
 #include <cmath>
 #include <inttypes.h>
@@ -28,19 +23,8 @@ extern void log_heap(const char* tag);
 
 // External references from main.cpp
 extern bool g_streaming;
-extern bool g_decode_enabled;
-extern int g_time_osr;
-extern int g_freq_osr;
-extern int64_t g_decode_slot_idx;
-extern volatile bool g_decode_in_progress;
-extern volatile int64_t g_decode_applied_slot_idx;
 extern volatile bool g_cdc_initial_sync_pending;
-void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
 int64_t rtc_now_ms();
-
-#ifndef FT8_SAMPLE_RATE
-#define FT8_SAMPLE_RATE 6000
-#endif
 
 // Task priorities and stack sizes
 #define USB_HOST_TASK_PRIORITY  5
@@ -110,9 +94,6 @@ static char s_debug_line2[64] = "";
 
 // Resampler state
 static resample_state_t s_resample_state;
-static uint8_t s_latest_waterfall_row[UAC_WATERFALL_ROW_WIDTH] = {0};
-static bool s_latest_waterfall_row_valid = false;
-static portMUX_TYPE s_latest_waterfall_row_lock = portMUX_INITIALIZER_UNLOCKED;
 
 // Forward declarations
 static void usb_lib_task(void* arg);
@@ -122,6 +103,9 @@ static void cdc_close(void);
 static void cdc_try_open(void);
 static void cdc_event_cb(const cdc_acm_host_dev_event_data_t* event, void* user_ctx);
 static void cdc_new_dev_cb(usb_device_handle_t usb_dev);
+static int uac_read_ft8_samples(void* ctx, float* out, int max_samples);
+static bool uac_should_stop(void* ctx);
+static void uac_on_block_processed(void* ctx);
 
 static const char* profile_name(uac_stream_profile_t profile) {
     switch (profile) {
@@ -132,45 +116,6 @@ static const char* profile_name(uac_stream_profile_t profile) {
     default:
         return "unknown";
     }
-}
-
-// Push waterfall row (same as stream_wav.cpp)
-static void push_waterfall_latest(const monitor_t& mon) {
-    if (mon.wf.num_blocks <= 0 || mon.wf.mag == nullptr) return;
-    const int block = mon.wf.num_blocks - 1;
-    const int num_bins = mon.wf.num_bins;
-    const int freq_osr = mon.wf.freq_osr;
-    const uint8_t* base = mon.wf.mag + block * mon.wf.block_stride;
-
-    static uint8_t collapsed[480];  // max num_bins
-    memset(collapsed, 0, num_bins);
-    for (int b = 0; b < num_bins; ++b) {
-        uint8_t v = 0;
-        for (int fs = 0; fs < freq_osr; ++fs) {
-            uint8_t val = base[fs * num_bins + b];
-            if (val > v) v = val;
-        }
-        collapsed[b] = v;
-    }
-
-    constexpr int width = UAC_WATERFALL_ROW_WIDTH;
-    static uint8_t scaled[width];
-    for (int x = 0; x < width; ++x) {
-        int start = (int)((int64_t)x * num_bins / width);
-        int end = (int)((int64_t)(x + 1) * num_bins / width);
-        if (end <= start) end = start + 1;
-        uint8_t maxv = 0;
-        for (int s = start; s < end && s < num_bins; ++s) {
-            if (collapsed[s] > maxv) maxv = collapsed[s];
-        }
-        scaled[x] = maxv;
-    }
-
-    ui_push_waterfall_row(scaled, width);
-    taskENTER_CRITICAL(&s_latest_waterfall_row_lock);
-    memcpy(s_latest_waterfall_row, scaled, width);
-    s_latest_waterfall_row_valid = true;
-    taskEXIT_CRITICAL(&s_latest_waterfall_row_lock);
 }
 
 // CDC-ACM helpers (CAT TX only)
@@ -559,69 +504,45 @@ static void uac_lib_task(void* arg) {
 
 // Audio streaming and processing task
 static void stream_uac_task(void* arg) {
+    (void)arg;
     ESP_LOGI(TAG, "Audio streaming task started");
 
-    // Initialize resampler
     resample_init(&s_resample_state);
-
-    // Wait until the next 15s boundary
-    {
-        int64_t now_ms = rtc_now_ms();
-        int64_t rem = now_ms % 15000;
-        int64_t wait_ms = (rem < 100) ? 0 : (15000 - rem);
-        if (wait_ms > 0) {
-            vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
-        }
-    }
-
-    // Initialize FT8 monitor
-    monitor_config_t mon_cfg = {
-        .f_min = 200.0f,
-        .f_max = 2900.0f,
-        .sample_rate = FT8_SAMPLE_RATE,
-        .time_osr = g_time_osr,
-        .freq_osr = g_freq_osr,
-        .protocol = FTX_PROTOCOL_FT8
-    };
-
-    monitor_t mon;
-    monitor_init(&mon, &mon_cfg);
-    monitor_reset(&mon);
-
-    // Allocate buffers
     uint8_t* usb_buffer = (uint8_t*)heap_caps_malloc(UAC_READ_BUFFER_SIZE, MALLOC_CAP_DEFAULT);
-    float* ft8_buffer = (float*)heap_caps_malloc(sizeof(float) * mon.block_size, MALLOC_CAP_DEFAULT);
-    // Intermediate 6kHz output buffer from PCM conversion/resampling.
-    float* temp_dec = (float*)heap_caps_malloc(sizeof(float) * 512, MALLOC_CAP_DEFAULT);
-    log_heap("UAC_AFTER_FFT_ALLOC");
-
-    if (!usb_buffer || !ft8_buffer || !temp_dec) {
-        ESP_LOGE(TAG, "Buffer allocation failed");
-        if (usb_buffer) free(usb_buffer);
-        if (ft8_buffer) free(ft8_buffer);
-        if (temp_dec) free(temp_dec);
-        monitor_free(&mon);
+    if (!usb_buffer) {
+        ESP_LOGE(TAG, "USB buffer allocation failed");
         s_stream_task_handle = NULL;
         vTaskDelete(NULL);
         return;
     }
 
-    const int target_blocks = 80;
-    int ft8_buffer_idx = 0;  // Current position in ft8_buffer
-    TickType_t next_wake = xTaskGetTickCount();
-    int slot_blocks = 0;
-    int64_t slot_idx = rtc_now_ms() / 15000;
-    int64_t slot_start_ms = slot_idx * 15000;
-    (void)slot_start_ms; // silence unused warning
+    ft8_audio_pipeline_config_t pipe_cfg = {
+        .tag = TAG,
+        .ctx = usb_buffer,
+        .read = uac_read_ft8_samples,
+        .should_stop = uac_should_stop,
+        .on_block_processed = uac_on_block_processed,
+    };
+    ft8_audio_pipeline_run(&pipe_cfg);
+
+    free(usb_buffer);
+    g_streaming = false;
+    s_stream_task_handle = NULL;
+    ESP_LOGI(TAG, "Audio streaming task stopped");
+    vTaskDelete(NULL);
+}
+
+static int uac_read_ft8_samples(void* ctx, float* out, int max_samples) {
+    (void)max_samples;
+    uint8_t* usb_buffer = (uint8_t*)ctx;
+    if (!usb_buffer || !out) return 0;
 
     while (!s_stop_requested && s_mic_handle != NULL) {
-        // Read USB audio data
         uint32_t bytes_read = 0;
         esp_err_t ret = uac_host_device_read(s_mic_handle, usb_buffer,
                                               UAC_READ_BUFFER_SIZE,
                                               &bytes_read,
                                               pdMS_TO_TICKS(200));
-
         if (ret != ESP_OK || bytes_read == 0) {
             if (ret != ESP_ERR_TIMEOUT && ret != ESP_FAIL) {
                 ESP_LOGW(TAG, "USB read error: %s", esp_err_to_name(ret));
@@ -636,126 +557,43 @@ static void stream_uac_task(void* arg) {
         }
         int num_frames = bytes_read / frame_bytes;
         int remainder = bytes_read % frame_bytes;
-
-        // Debug display
-        if (num_frames > 0) {
-            int32_t val = 0;
-            if (s_format.bit_resolution == 24) {
-                val = usb_buffer[0] | (usb_buffer[1] << 8) | (usb_buffer[2] << 16);
-                if (val & 0x800000) val |= 0xFF000000;
-            } else { // 16-bit
-                int16_t v16 = (int16_t)(usb_buffer[0] | (usb_buffer[1] << 8));
-                val = v16;
-            }
-            snprintf(s_debug_line1, sizeof(s_debug_line1),
-                     "fmt=%lu/%u/%u v=%ld",
-                     (unsigned long)s_format.sample_freq,
-                     s_format.bit_resolution,
-                     s_format.channels,
-                     (long)val);
-            snprintf(s_debug_line2, sizeof(s_debug_line2),
-                     "rd=%lu fb=%d rem=%d", (unsigned long)bytes_read, frame_bytes, remainder);
-        }
-
         if (num_frames == 0) continue;
 
-        // Convert and resample selected USB PCM format -> 6kHz mono float.
-        int samples_dec = uac_pcm_to_ft8_samples(&s_resample_state, usb_buffer,
-                                                 (int)bytes_read, temp_dec,
-                                                 s_format.bit_resolution,
-                                                 s_format.channels);
-
-        // Accumulate into ft8_buffer
-        for (int i = 0; i < samples_dec && !s_stop_requested; i++) {
-            ft8_buffer[ft8_buffer_idx++] = temp_dec[i];
-
-            // When we have a full block (960 samples = 160ms at 6kHz)
-            if (ft8_buffer_idx >= mon.block_size) {
-                // Apply gain normalization (same as stream_wav.cpp)
-                double acc = 0.0;
-                for (int j = 0; j < mon.block_size; ++j) {
-                    acc += fabsf(ft8_buffer[j]);
-                }
-                float level = (float)(acc / mon.block_size);
-                float gain = (level > 1e-6f) ? 0.1f / level : 1.0f;
-                if (gain < 0.1f) gain = 0.1f;
-                if (gain > 10.0f) gain = 10.0f;
-                for (int j = 0; j < mon.block_size; ++j) {
-                    ft8_buffer[j] *= gain;
-                }
-
-                // Process through monitor
-                if (mon.wf.num_blocks < target_blocks) {
-                    monitor_process(&mon, ft8_buffer);
-                    push_waterfall_latest(mon);
-                }
-
-                // Retry CDC open periodically until success
-                if (!s_cdc_handle) {
-                    cdc_try_open();
-                }
-
-                ft8_buffer_idx = 0;
-
-                // Maintain 160ms timing
-                vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(160));
-
-                // Align decode to 15s boundaries based on RTC
-                slot_blocks++;
-                int64_t now_idx = rtc_now_ms() / 15000;
-                if (now_idx != slot_idx) {
-                    ESP_LOGI(TAG, "Slot boundary %lld->%lld blocks=%d wf=%d",
-                             (long long)slot_idx, (long long)now_idx,
-                             slot_blocks, mon.wf.num_blocks);
-                    // The slot that just ended (slot_idx) is considered "applied"
-                    // whether we decoded it or not — we're moving past it either
-                    // way, so subsequent TX slots shouldn't block waiting for it.
-                    if (slot_idx > g_decode_applied_slot_idx) {
-                        g_decode_applied_slot_idx = slot_idx;
-                    }
-                    // Reset counters at the boundary
-                    slot_idx = now_idx;
-                    slot_start_ms = slot_idx * 15000;
-                    slot_blocks = 0;
-                    mon.wf.num_blocks = 0;
-                    monitor_reset(&mon);
-                    next_wake = xTaskGetTickCount();
-                } else if (slot_blocks >= 79 && mon.wf.num_blocks >= 79) {
-                    ESP_LOGI(TAG, "Triggering decode at slot %lld blocks=%d wf=%d",
-                             (long long)slot_idx, slot_blocks, mon.wf.num_blocks);
-                    if (g_decode_enabled) {
-                        g_decode_slot_idx = slot_idx;
-                        g_decode_in_progress = true;  // Block TX trigger until decode finishes
-                        decode_monitor_results(&mon, &mon_cfg, false);
-                        // g_decode_in_progress and g_decode_applied_slot_idx are
-                        // both updated at the end of decode_monitor_results.
-                    } else {
-                        ESP_LOGI(TAG, "Decode paused; skipping");
-                        // Decode disabled — still mark as applied so TX isn't
-                        // blocked waiting for a decode that won't happen.
-                        if (slot_idx > g_decode_applied_slot_idx) {
-                            g_decode_applied_slot_idx = slot_idx;
-                        }
-                    }
-                    monitor_reset(&mon);
-                    mon.wf.num_blocks = 0;
-                    slot_blocks = 0;
-                    next_wake = xTaskGetTickCount();
-                }
-            }
+        int32_t val = 0;
+        if (s_format.bit_resolution == 24) {
+            val = usb_buffer[0] | (usb_buffer[1] << 8) | (usb_buffer[2] << 16);
+            if (val & 0x800000) val |= 0xFF000000;
+        } else {
+            int16_t v16 = (int16_t)(usb_buffer[0] | (usb_buffer[1] << 8));
+            val = v16;
         }
+        snprintf(s_debug_line1, sizeof(s_debug_line1),
+                 "fmt=%lu/%u/%u v=%ld",
+                 (unsigned long)s_format.sample_freq,
+                 s_format.bit_resolution,
+                 s_format.channels,
+                 (long)val);
+        snprintf(s_debug_line2, sizeof(s_debug_line2),
+                 "rd=%lu fb=%d rem=%d", (unsigned long)bytes_read, frame_bytes, remainder);
+
+        return uac_pcm_to_ft8_samples(&s_resample_state, usb_buffer,
+                                      (int)bytes_read, out,
+                                      s_format.bit_resolution,
+                                      s_format.channels);
     }
+    return 0;
+}
 
-    // Cleanup
-    free(usb_buffer);
-    free(ft8_buffer);
-    free(temp_dec);
-    monitor_free(&mon);
+static bool uac_should_stop(void* ctx) {
+    (void)ctx;
+    return s_stop_requested || s_mic_handle == NULL;
+}
 
-    g_streaming = false;
-    s_stream_task_handle = NULL;
-    ESP_LOGI(TAG, "Audio streaming task stopped");
-    vTaskDelete(NULL);
+static void uac_on_block_processed(void* ctx) {
+    (void)ctx;
+    if (!s_cdc_handle) {
+        cdc_try_open();
+    }
 }
 
 // Public API implementation
@@ -768,15 +606,7 @@ bool uac_is_streaming(void) {
 }
 
 bool uac_get_latest_waterfall_row(uint8_t* out_row, int out_len) {
-    if (!out_row || out_len < UAC_WATERFALL_ROW_WIDTH) return false;
-    bool valid = false;
-    taskENTER_CRITICAL(&s_latest_waterfall_row_lock);
-    valid = s_latest_waterfall_row_valid;
-    if (valid) {
-        memcpy(out_row, s_latest_waterfall_row, UAC_WATERFALL_ROW_WIDTH);
-    }
-    taskEXIT_CRITICAL(&s_latest_waterfall_row_lock);
-    return valid;
+    return ft8_audio_pipeline_get_latest_waterfall_row(out_row, out_len);
 }
 
 bool uac_start_with_profile(uac_stream_profile_t profile) {
@@ -792,10 +622,7 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
     s_format.sample_freq = UAC_SAMPLE_RATE;
     s_format.bit_resolution = UAC_BIT_RESOLUTION;
     s_format.channels = UAC_CHANNELS;
-    taskENTER_CRITICAL(&s_latest_waterfall_row_lock);
-    memset(s_latest_waterfall_row, 0, sizeof(s_latest_waterfall_row));
-    s_latest_waterfall_row_valid = false;
-    taskEXIT_CRITICAL(&s_latest_waterfall_row_lock);
+    ft8_audio_pipeline_clear_latest_waterfall_row();
 
     ESP_LOGI(TAG, "Starting UAC host profile=%s", profile_name(s_profile));
     s_stop_requested = false;
@@ -874,10 +701,7 @@ void uac_stop(void) {
     }
 
     s_state = UAC_STATE_IDLE;
-    taskENTER_CRITICAL(&s_latest_waterfall_row_lock);
-    memset(s_latest_waterfall_row, 0, sizeof(s_latest_waterfall_row));
-    s_latest_waterfall_row_valid = false;
-    taskEXIT_CRITICAL(&s_latest_waterfall_row_lock);
+    ft8_audio_pipeline_clear_latest_waterfall_row();
     snprintf(s_status_string, sizeof(s_status_string), "Idle");
     ESP_LOGI(TAG, "UAC host stopped");
 }

@@ -107,12 +107,21 @@ void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, 
     M5.Display.endWrite();
 }
 
-void ui_init() {
+void ui_init(bool display_only) {
     g_disp_mutex = xSemaphoreCreateMutex();
-    auto cfg = M5.config();
-    cfg.output_power = true;
-    cfg.external_rtc = false;
-    M5Cardputer.begin(cfg, true);
+    if (display_only) {
+        // KH1-MIC needs display-only board init: full M5Unified startup can
+        // claim ES8311/I2S audio resources before the native mic path opens them.
+        M5Cardputer.beginDisplayOnly(true);
+    } else {
+        auto cfg = M5.config();
+        cfg.output_power = true;
+        cfg.external_rtc = false;
+        cfg.internal_mic = false;
+        cfg.internal_spk = false;
+        cfg.external_speaker_value = 0;
+        M5Cardputer.begin(cfg, true);
+    }
     M5.Display.setRotation(1);
     M5.Display.fillScreen(TFT_BLACK);
     ui_draw_countdown(0.0f, true, 1500);
