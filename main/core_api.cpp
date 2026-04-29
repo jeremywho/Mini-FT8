@@ -641,10 +641,10 @@ CoreAdifHandle core_adif_open() {
   CoreAdifHandle h{-1, -1};
   if (g_adif.fp) return h;  // single-reader invariant
 
-  // Find most recent .adi file in /spiffs.
+  // Find most recent .adi file in /storage.
   // For simplicity, we just try today's filename; step 3 can add the
   // full "pick most recent from listing" logic.
-  // Build "/spiffs/YYYYMMDD.adi" from g_date.
+  // Build "/storage/YYYYMMDD.adi" from g_date.
   char path[64];
   const char* d = g_date.c_str();
   // strip dashes
@@ -653,7 +653,7 @@ CoreAdifHandle core_adif_open() {
   for (int i = 0; d[i] && o < 8; ++i) {
     if (d[i] >= '0' && d[i] <= '9') yyyymmdd[o++] = d[i];
   }
-  snprintf(path, sizeof(path), "/spiffs/%s.adi", yyyymmdd);
+  snprintf(path, sizeof(path), "/storage/%s.adi", yyyymmdd);
 
   FILE* f = fopen(path, "rb");
   if (!f) return h;

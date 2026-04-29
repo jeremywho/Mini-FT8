@@ -4,8 +4,8 @@ cmake_minimum_required(VERSION 3.16)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(mini_ft8)
-# Build SPIFFS image, but do NOT include it in default flash target (preserve on-device files)
-spiffs_create_partition_image(spiffs ${CMAKE_SOURCE_DIR}/spiffs_image)
+# User-data partition is FATFS now (formatted on first boot). No prebuilt
+# image — operators copy logs off via terminal/SD/MSC.
 
 # Automatically generate a single merged binary file (like in the release directory) after every build
 add_custom_command(TARGET app POST_BUILD

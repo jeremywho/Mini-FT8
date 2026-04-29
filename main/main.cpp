@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <cmath>
 #include "esp_log.h"
-#include "esp_spiffs.h"
+#include "wear_levelling.h"
 extern "C" {
   #include "ft8/decode.h"
   #include "ft8/constants.h"
@@ -61,7 +61,7 @@ extern "C" {
 #include "sdmmc_cmd.h"
 #include "esp_vfs_fat.h"
 
-static const char* STATION_FILE = "/spiffs/Station.txt";
+static const char* STATION_FILE = "/storage/Station.txt";
 static sdmmc_card_t* g_sd_card = NULL;
 static bool g_sd_mounted = false;
 static bool g_ble_enabled = true;
@@ -543,7 +543,7 @@ static void build_rxtx_log_path(char* path, size_t path_sz) {
   localtime_r(&now, &t);
 
   // RT[YYMMDD].txt
-  snprintf(path, path_sz, "/spiffs/RT%02d%02d%02d.txt",
+  snprintf(path, path_sz, "/storage/RT%02d%02d%02d.txt",
            (t.tm_year + 1900) % 100,
            (t.tm_mon + 1) % 100,
            t.tm_mday % 100);
@@ -563,7 +563,7 @@ static void sync_station_txt_from_sd_to_spiffs() {
   }
 
   const char* sd_path = "/sdcard/Station.txt";
-  const char* spiffs_path = "/spiffs/Station.txt";
+  const char* spiffs_path = "/storage/Station.txt";
 
   if (!file_exists(sd_path)) {
     ESP_LOGI(TAG, "No Station.txt on SD, using SPIFFS Station.txt");
@@ -631,14 +631,14 @@ static esp_err_t copy_file_overwrite_retry(const char* src_path, const char* dst
 
 static bool collect_spiffs_regular_files(std::vector<std::string>& out_files) {
   out_files.clear();
-  DIR* d = opendir("/spiffs");
+  DIR* d = opendir("/storage");
   if (!d) return false;
 
   struct dirent* ent;
   while ((ent = readdir(d)) != nullptr) {
     const char* name = ent->d_name;
     if (!name || name[0] == '.') continue;
-    std::string src = std::string("/spiffs/") + name;
+    std::string src = std::string("/storage/") + name;
     struct stat st;
     if (stat(src.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
     out_files.emplace_back(name);
@@ -695,7 +695,7 @@ static CopyLogsResult copy_logs_spiffs_to_sd_overwrite() {
     for (const auto& name : files) {
       auto it = copied_ok.find(name);
       if (it != copied_ok.end() && it->second) continue;
-      const std::string src = std::string("/spiffs/") + name;
+      const std::string src = std::string("/storage/") + name;
       const std::string dst = std::string("/sdcard/") + name;
       esp_err_t err = copy_file_overwrite_retry(src.c_str(), dst.c_str());
       set_copy_status(name, err);
@@ -708,7 +708,7 @@ static CopyLogsResult copy_logs_spiffs_to_sd_overwrite() {
 
   // Explicit post-pass for current-day QSO file.
   const std::string qso_name = today_qso_file_name();
-  const std::string qso_src = std::string("/spiffs/") + qso_name;
+  const std::string qso_src = std::string("/storage/") + qso_name;
   struct stat qso_st;
   if (stat(qso_src.c_str(), &qso_st) == 0 && S_ISREG(qso_st.st_mode)) {
     const std::string qso_dst = std::string("/sdcard/") + qso_name;
@@ -1025,6 +1025,7 @@ static UIMode g_ble_qso_return_mode = UIMode::RX;
 
 static void host_handle_line(const std::string& line);
 void save_station_data();  // visible to core_api.cpp
+static bool storage_is_mounted();   // defined alongside the FATFS mount helpers
 
 // Deferred-save flag. core_api.cpp's RPC handlers (running on the
 // shallow ble_native task) flip this to ask the main task to flush
@@ -1420,7 +1421,7 @@ static void log_cabrillo_fd_entry(const std::string& dxcall, const std::string& 
   // Frequency: use selected band dial frequency (kHz)
   int freq_khz = (int)g_bands[g_band_sel].freq;
 
-  const char* path = "/spiffs/fieldday.txt";
+  const char* path = "/storage/fieldday.txt";
 
   std::string location = fd_get_section_from_exchange(my_fd);
   cabrillo_fd_ensure_header(path, g_call, location);
@@ -1498,7 +1499,7 @@ static void qso_load_file_list() {
   g_q_files.clear();
   g_q_entries.clear();
   g_q_lines.clear();
-  DIR* dir = opendir("/spiffs");
+  DIR* dir = opendir("/storage");
   if (!dir) {
     g_q_lines.push_back("No QSO logs");
     return;
@@ -1523,13 +1524,13 @@ static void qso_load_file_list() {
 
 static void load_spiffs_regular_files(std::vector<std::string>& files) {
   files.clear();
-  DIR* dir = opendir("/spiffs");
+  DIR* dir = opendir("/storage");
   if (!dir) return;
   struct dirent* ent;
   while ((ent = readdir(dir)) != nullptr) {
     const char* name = ent->d_name;
     if (!name || name[0] == '.') continue;
-    std::string path = std::string("/spiffs/") + name;
+    std::string path = std::string("/storage/") + name;
     struct stat st;
     if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
     files.emplace_back(name);
@@ -1624,7 +1625,7 @@ static void qso_rebuild_entry_lines() {
 static void qso_load_entries(const std::string& path) {
   g_q_entries.clear();
   g_q_lines.clear();
-  std::string full = std::string("/spiffs/") + path;
+  std::string full = std::string("/storage/") + path;
   FILE* f = fopen(full.c_str(), "r");
   if (!f) {
     g_q_lines.push_back("Open fail");
@@ -1713,7 +1714,7 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
   int day = t.tm_mday;
   snprintf(date, sizeof(date), "%04d%02d%02d", year % 10000, month % 100, day % 100);
   char path[64];
-  snprintf(path, sizeof(path), "/spiffs/%s.txt", date);
+  snprintf(path, sizeof(path), "/storage/%s.txt", date);
 
   bool need_header = false;
   struct stat st;
@@ -4218,7 +4219,7 @@ static void ble_dump_qso_file(const std::string& file_name) {
   g_ble_dump_in_progress = true;
   const bool use_indicate = g_ble_tx_indicate_enabled;
   ble_dump_reset_transfer_state(use_indicate);
-  std::string full_path = std::string("/spiffs/") + file_name;
+  std::string full_path = std::string("/storage/") + file_name;
   if (!use_indicate) {
     (void)ble_dump_send_line("fallback notify mode (best effort)");
   }
@@ -4594,7 +4595,7 @@ static void host_handle_line(const std::string& line_in) {
     if (fname.empty()) {
       send("ERROR: filename required");
     } else {
-      std::string path = std::string("/spiffs/") + fname;
+      std::string path = std::string("/storage/") + fname;
       const char* mode = (cmd_up == "WRITE") ? "w" : "a";
       FILE* f = fopen(path.c_str(), mode);
       if (!f) send("ERROR: open failed");
@@ -4603,7 +4604,7 @@ static void host_handle_line(const std::string& line_in) {
   } else if (cmd_up == "READ") {
     if (rest.empty()) send("ERROR: filename required");
     else {
-      std::string path = std::string("/spiffs/") + rest;
+      std::string path = std::string("/storage/") + rest;
       FILE* f = fopen(path.c_str(), "r");
       if (!f) send("ERROR: open failed");
       else {
@@ -4617,11 +4618,11 @@ static void host_handle_line(const std::string& line_in) {
   } else if (cmd_up == "DELETE") {
     if (rest.empty()) send("ERROR: filename required");
     else {
-      std::string path = std::string("/spiffs/") + rest;
+      std::string path = std::string("/storage/") + rest;
       if (unlink(path.c_str()) == 0) send("OK"); else send("ERROR: delete failed");
     }
   } else if (cmd_up == "LIST") {
-    DIR* d = opendir("/spiffs");
+    DIR* d = opendir("/storage");
     if (!d) send("ERROR: opendir failed");
     else {
       struct dirent* ent;
@@ -4643,7 +4644,7 @@ static void host_handle_line(const std::string& line_in) {
     } else if (host_bin_active) {
       send("ERROR: binary upload in progress");
     } else {
-      std::string path = std::string("/spiffs/") + fname;
+      std::string path = std::string("/storage/") + fname;
       FILE* f = fopen(path.c_str(), "wb");
       if (!f) {
         send("ERROR: open failed");
@@ -4973,6 +4974,13 @@ static void load_station_data() {
 }
 
 void save_station_data() {
+  // During the boot-load window, FATFS is unmounted so the USB-host
+  // stack can claim DMA-capable heap. Defer until the main loop's
+  // post-init drain re-mounts and processes the pending flag.
+  if (!storage_is_mounted()) {
+    g_config_save_pending = true;
+    return;
+  }
   FILE* f = fopen(STATION_FILE, "w");
   if (!f) {
     ESP_LOGE(TAG, "Failed to open %s for write", STATION_FILE);
@@ -5348,14 +5356,47 @@ static void begin_usb_host_mode() {
   }
 }
 
+static wl_handle_t s_storage_wl_handle = WL_INVALID_HANDLE;
+// True between the boot-load unmount and the post-USB-init re-mount;
+// reads/writes during this window have to defer.
+static bool s_storage_init_phase = false;
+
+static bool storage_is_mounted() {
+  return s_storage_wl_handle != WL_INVALID_HANDLE;
+}
+
+static esp_err_t mount_storage() {
+  if (storage_is_mounted()) return ESP_OK;
+  esp_vfs_fat_mount_config_t mount_config = {};
+  mount_config.format_if_mount_failed = true;
+  // Mini-FT8 only ever has one or two files open at once (Station.txt,
+  // a daily log). Drop max_files from the prior 5 → 3 for a small
+  // additional saving — pairs with CONFIG_FATFS_PER_FILE_CACHE=n in
+  // sdkconfig (the bigger win, freed ~16 KB heap).
+  mount_config.max_files = 3;
+  // 4 KB clusters on a 1 MB partition → 256 clusters total. Keeps the
+  // FAT table small (FAT12) and the wear_levelling state proportional —
+  // tighter than the default but still way more capacity than a season
+  // of ADIF logs.
+  mount_config.allocation_unit_size = 4096;
+  return esp_vfs_fat_spiflash_mount_rw_wl(
+      "/storage", "storage", &mount_config, &s_storage_wl_handle);
+}
+
+static void unmount_storage() {
+  if (!storage_is_mounted()) return;
+  esp_vfs_fat_spiflash_unmount_rw_wl("/storage", s_storage_wl_handle);
+  s_storage_wl_handle = WL_INVALID_HANDLE;
+}
+
 static void app_task_core0(void* /*param*/) {
-  esp_vfs_spiffs_conf_t conf = {
-    .base_path = "/spiffs",
-    .partition_label = NULL,
-    .max_files = 5,
-    .format_if_mount_failed = true
-  };
-  ESP_ERROR_CHECK(esp_vfs_spiffs_register(&conf));
+  // Boot-load window. Mount FATFS just long enough to read Station.txt,
+  // then unmount so the USB-host stack's DMA-capable allocations during
+  // begin_usb_host_mode have a clear heap budget. The main loop below
+  // re-mounts permanently once the USB-host init window has closed
+  // (QMX detected, or no-QMX fallback resolved).
+  ESP_ERROR_CHECK(mount_storage());
+  s_storage_init_phase = true;
 
   // Initialize mutexes for thread-safe operations
   log_mutex = xSemaphoreCreateMutex();
@@ -5390,6 +5431,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
   ui_mode = UIMode::RX;
   load_station_data();
+  // Boot-load complete — release FATFS heap before NimBLE/USB host
+  // initialise. Re-mounted in the main loop after the USB-host init
+  // window closes.
+  unmount_storage();
   init_bluetooth();
   apply_ble_enabled_policy(true);
   apply_radio_profile_binding();
@@ -5580,11 +5625,40 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     check_slot_boundary();  // TX trigger at slot boundary (matching reference architecture)
     tx_tick();              // Process TX state machine (single-threaded, non-blocking)
 
-    // Drain deferred config saves requested by the BLE RPC dispatch.
-    // Clear before saving so a write that lands during the save just
-    // re-arms us for the next tick (we never lose an update; we may
-    // re-save once unnecessarily, which is fine).
-    if (g_config_save_pending) {
+    // Re-mount FATFS once USB host has settled.
+    //
+    // Subtle: g_qmx_detect_active clears the moment UAC sees the mic, but
+    // cdc_acm_host_open is still claiming DMA-capable transfer buffers for
+    // ~200 ms after that. Mounting FATFS in that gap starves CDC and trips
+    // a tlsf double-free inside cdc_acm's error path. Wait for cat_cdc_ready
+    // (CDC fully open) OR a grace timeout after eligibility — the timeout
+    // covers CONTROL fallback, generic UAC, and QMX-lookalikes whose CDC
+    // never opens.
+    static int64_t s_remount_eligible_ms = 0;
+    constexpr int64_t kRemountSettleMs = 2000;
+    if (s_storage_init_phase && !g_startup_active && !g_qmx_detect_active) {
+      int64_t now_ms = esp_timer_get_time() / 1000;
+      if (s_remount_eligible_ms == 0) s_remount_eligible_ms = now_ms;
+      bool cdc_settled = cat_cdc_ready();
+      bool grace_elapsed = (now_ms - s_remount_eligible_ms) >= kRemountSettleMs;
+      if (cdc_settled || grace_elapsed) {
+        esp_err_t err = mount_storage();
+        if (err == ESP_OK) {
+          ESP_LOGI(TAG, "Storage re-mounted post-USB-init (cdc_ready=%d)",
+                   cdc_settled ? 1 : 0);
+        } else {
+          ESP_LOGE(TAG, "Storage re-mount failed: %s — saves will be skipped",
+                   esp_err_to_name(err));
+        }
+        s_storage_init_phase = false;
+      }
+    }
+
+    // Drain deferred config saves requested by the BLE RPC dispatch
+    // (and by save_station_data calls that landed during the boot-load
+    // window). Skip while storage is unmounted; the flag stays set and
+    // will be drained on a future tick once mount succeeds.
+    if (g_config_save_pending && storage_is_mounted()) {
       g_config_save_pending = false;
       save_station_data();
     }
@@ -6037,7 +6111,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             int idx = d_page * 6 + (c - '1');
             if (idx >= 0 && idx < (int)g_d_files.size()) {
               std::string deleted = g_d_files[idx];
-              std::string path = std::string("/spiffs/") + deleted;
+              std::string path = std::string("/storage/") + deleted;
               if (unlink(path.c_str()) == 0) {
                 debug_log_line(std::string("Deleted: ") + deleted);
               } else {
