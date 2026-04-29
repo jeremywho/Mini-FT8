@@ -53,6 +53,7 @@ extern "C" {
 #include "stream_uac.h"
 #include "radio_control.h"
 #include "radio_control_backend.h"
+#include "radio_trusdx.h"
 #include "gps.h"
 
 #include "driver/spi_master.h"
@@ -1186,6 +1187,7 @@ static bool g_rxtx_log = true;
 static RadioType canonical_radio_type(RadioType r);
 static RadioType parse_radio_config_value(const char* raw);
 static bool is_kh1_radio(RadioType r);
+static bool is_trusdx_radio(RadioType r);
 static bool radio_type_uses_display_only(RadioType r);
 static RadioProfileBinding get_radio_profile_binding(RadioType r);
 static void apply_radio_profile_binding();
@@ -1995,13 +1997,17 @@ static const char* offset_name(OffsetSrc o) {
 }
 
 static RadioType canonical_radio_type(RadioType r) {
-  if (r == RadioType::KH1_USBC || r == RadioType::KH1_MIC) return r;
+  if (r == RadioType::TRUSDX || r == RadioType::KH1_USBC || r == RadioType::KH1_MIC) return r;
   return RadioType::QMX;
 }
 
 static bool is_kh1_radio(RadioType r) {
   r = canonical_radio_type(r);
   return r == RadioType::KH1_USBC || r == RadioType::KH1_MIC;
+}
+
+static bool is_trusdx_radio(RadioType r) {
+  return canonical_radio_type(r) == RadioType::TRUSDX;
 }
 
 static bool radio_type_uses_display_only(RadioType r) {
@@ -2011,6 +2017,8 @@ static bool radio_type_uses_display_only(RadioType r) {
 
 static RadioType radio_type_from_saved_int(int value) {
   switch (value) {
+    case (int)RadioType::TRUSDX:
+      return RadioType::TRUSDX;
     case (int)RadioType::KH1_USBC:
       return RadioType::KH1_USBC;
     case (int)RadioType::KH1_MIC:
@@ -2043,11 +2051,16 @@ static RadioType parse_radio_config_value(const char* raw) {
   if (token == "KH1-MIC" || token == "KH1_MIC" || token == "KH1MIC") {
     return RadioType::KH1_MIC;
   }
+  if (token == "TRUSDX" || token == "TRU-SDX" || token == "(TR)USDX") {
+    return RadioType::TRUSDX;
+  }
   return RadioType::QMX;
 }
 
 static RadioProfileBinding get_radio_profile_binding(RadioType r) {
   switch (canonical_radio_type(r)) {
+    case RadioType::TRUSDX:
+      return {AUDIO_SOURCE_TRUSDX_SERIAL, RADIO_CONTROL_TRUSDX_CAT};
     case RadioType::KH1_USBC:
       return {AUDIO_SOURCE_USB_UAC_GENERIC, RADIO_CONTROL_KH1_CAT};
     case RadioType::KH1_MIC:
@@ -2060,6 +2073,7 @@ static RadioProfileBinding get_radio_profile_binding(RadioType r) {
 
 static const char* radio_name(RadioType r) {
   switch (canonical_radio_type(r)) {
+    case RadioType::TRUSDX: return "truSDX";
     case RadioType::QMX: return "QMX";
     case RadioType::KH1_USBC: return "KH1-USBC";
     case RadioType::KH1_MIC: return "KH1-MIC";
@@ -3475,6 +3489,19 @@ static void tx_start(int skip_tones) {
   ESP_LOGI(TAG, "tx_start: TX=%s offset=%d skip=%d slot=%lld",
            g_pending_tx.text.c_str(), g_pending_tx.offset_hz, skip_tones, (long long)g_tx_slot_idx);
 
+  if (is_trusdx_radio(g_radio)) {
+    if (g_tune) {
+      ESP_LOGW(TAG, "tx_start: truSDX TX blocked while tune is ON");
+      g_was_txing = false;
+      return;
+    }
+    if (!radio_control_ready()) {
+      ESP_LOGW(TAG, "tx_start: truSDX not ready");
+      g_was_txing = false;
+      return;
+    }
+  }
+
   // Notify autoseq that TX emission is starting. This is the single canonical
   // logging trigger — if we're about to emit TX4 (RR73) or TX5 (73), autoseq
   // writes the ADIF entry now.
@@ -3503,6 +3530,20 @@ static void tx_start(int skip_tones) {
   g_tx_last_ta_frac = -1;
 
   ESP_LOGI(TAG, "TX base_hz=%d (from pre-computed offset, text=%s)", g_tx_base_hz, g_pending_tx.text.c_str());
+
+  if (is_trusdx_radio(g_radio)) {
+    esp_err_t err = radio_trusdx_begin_ft8_tx(g_tx_tones, g_tx_base_hz,
+                                              g_tx_slot_start_ms, now_ms);
+    if (err != ESP_OK) {
+      ESP_LOGW(TAG, "tx_start: truSDX stream begin failed: %s", esp_err_to_name(err));
+      g_was_txing = false;
+      g_tx_cat_ok = false;
+      return;
+    }
+    g_tx_cat_ok = true;
+    g_tx_active = true;
+    return;
+  }
 
   // Send CAT setup commands
   g_tx_cat_ok = radio_control_ready();
@@ -3537,6 +3578,39 @@ static void tx_tick() {
   }
 
   int64_t now_ms = rtc_now_ms();
+
+  if (is_trusdx_radio(g_radio)) {
+    if (g_tx_cancel_requested) {
+      ESP_LOGI(TAG, "tx_tick: truSDX TX cancel requested");
+      radio_trusdx_cancel_ft8_tx();
+    }
+
+    int elapsed_ms = (int)(now_ms - g_tx_slot_start_ms);
+    int display_tone = elapsed_ms / 160;
+    if (display_tone >= 0 && display_tone < 79 && display_tone != g_tx_tone_idx) {
+      g_tx_tone_idx = display_tone;
+      fft_waterfall_tx_tone(g_tx_tones[g_tx_tone_idx]);
+    }
+
+    if (!radio_trusdx_ft8_tx_active() &&
+        (radio_trusdx_ft8_tx_done() || radio_trusdx_ft8_tx_failed())) {
+      bool ok = radio_trusdx_ft8_tx_done() && !radio_trusdx_ft8_tx_failed();
+      if (ok) {
+        ESP_LOGI(TAG, "tx_tick: truSDX TX complete");
+        s_last_tx_slot_idx = g_tx_slot_idx;
+        autoseq_mark_sent(g_tx_slot_idx);
+      } else {
+        ESP_LOGW(TAG, "tx_tick: truSDX TX failed/cancelled");
+        g_was_txing = false;
+      }
+      radio_trusdx_clear_ft8_tx_result();
+      g_tx_active = false;
+      g_pending_tx_valid = false;
+      g_tx_cancel_requested = false;
+      g_tx_view_dirty = true;
+    }
+    return;
+  }
 
   // Check for cancel request
   if (g_tx_cancel_requested) {
@@ -5898,18 +5972,38 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             // relay, and we don't want to click it on every S->3 press.
           }
               else if (c == '4') {
-                g_tune = !g_tune;
-                if (radio_control_ready()) {
-                  int freq_hz = g_bands[g_band_sel].freq * 1000;
-                  int tune_hz = (g_offset_src == OffsetSrc::CURSOR) ? g_offset_hz : 1500;
-                  if (radio_control_set_tune(g_tune, freq_hz, tune_hz) == ESP_OK) {
-                    debug_log_line(g_tune ? "CAT tune: TX" : "CAT tune: RX");
+                if (is_trusdx_radio(g_radio)) {
+                  bool desired_tune = !g_tune;
+                  if (desired_tune && g_tx_active) {
+                    ESP_LOGW(TAG, "truSDX tune rejected while TX active");
+                    debug_log_line("truSDX tune busy");
+                  } else if (radio_control_ready()) {
+                    int freq_hz = g_bands[g_band_sel].freq * 1000;
+                    int tune_hz = (g_offset_src == OffsetSrc::CURSOR) ? g_offset_hz : 1500;
+                    if (radio_control_set_tune(desired_tune, freq_hz, tune_hz) == ESP_OK) {
+                      g_tune = desired_tune;
+                      debug_log_line(g_tune ? "CAT tune: TX" : "CAT tune: RX");
+                    } else {
+                      ESP_LOGW(TAG, "truSDX tune command failed");
+                      debug_log_line("CAT tune failed");
+                    }
                   } else {
-                    ESP_LOGW(TAG, "CAT tune command failed");
-                    debug_log_line("CAT tune failed");
+                    ESP_LOGW(TAG, "CAT not ready; tune skipped");
                   }
                 } else {
-                  ESP_LOGW(TAG, "CAT not ready; tune skipped");
+                  g_tune = !g_tune;
+                  if (radio_control_ready()) {
+                    int freq_hz = g_bands[g_band_sel].freq * 1000;
+                    int tune_hz = (g_offset_src == OffsetSrc::CURSOR) ? g_offset_hz : 1500;
+                    if (radio_control_set_tune(g_tune, freq_hz, tune_hz) == ESP_OK) {
+                      debug_log_line(g_tune ? "CAT tune: TX" : "CAT tune: RX");
+                    } else {
+                      ESP_LOGW(TAG, "CAT tune command failed");
+                      debug_log_line("CAT tune failed");
+                    }
+                  } else {
+                    ESP_LOGW(TAG, "CAT not ready; tune skipped");
+                  }
                 }
                 draw_status_view();
               }
@@ -6312,6 +6406,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                       g_radio = RadioType::KH1_MIC;
                       break;
                     case RadioType::KH1_MIC:
+                      g_radio = RadioType::TRUSDX;
+                      break;
+                    case RadioType::TRUSDX:
                     default:
                       g_radio = RadioType::QMX;
                       break;
