@@ -7,6 +7,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_attr.h"
 #include "usb/usb_host.h"
 #include "usb/uac_host.h"
 #include "usb/cdc_acm_host.h"
@@ -19,6 +20,7 @@ extern "C" {
 }
 
 #include "ui.h"
+#include "core_api_internal.h"
 #include <cstring>
 #include <cmath>
 #include <inttypes.h>
@@ -52,6 +54,12 @@ int64_t rtc_now_ms();
 // UAC read buffer size (bytes) - must be multiple of 288 (USB transfer size at 48kHz/24bit/stereo)
 // 288 bytes = 48 stereo samples per 1ms USB transfer, 4608 = 288 * 16
 #define UAC_READ_BUFFER_SIZE    4608
+
+// USB host DMAs into this buffer. Placed in DMA-capable BSS via DMA_ATTR so
+// task start-up doesn't depend on finding a large DMA-capable heap block —
+// previously heap_caps_malloc(MALLOC_CAP_DMA) failed under fragmentation
+// even when raw free bytes looked sufficient (alignment eats into runs).
+static DMA_ATTR uint8_t s_usb_buffer[UAC_READ_BUFFER_SIZE];
 
 typedef struct {
     uint32_t sample_freq;
@@ -134,7 +142,15 @@ static const char* profile_name(uac_stream_profile_t profile) {
     }
 }
 
-// Push waterfall row (same as stream_wav.cpp)
+// Push waterfall row — zero-copy at freq_osr=1 (our current config).
+// `base` points into mon.wf.mag for the most recently written block's
+// data. That memory is stable until the next slot boundary (other blocks
+// write to different offsets), so downstream consumers (UI scaling here,
+// ble_native elsewhere) can read from it safely without us copying.
+//
+// At freq_osr>1 we still need a scratch buffer to merge the multiple
+// frequency-sub bands into one row — but since we're at freq_osr=1, no
+// static or stack buffer is allocated here in practice.
 static void push_waterfall_latest(const monitor_t& mon) {
     if (mon.wf.num_blocks <= 0 || mon.wf.mag == nullptr) return;
     const int block = mon.wf.num_blocks - 1;
@@ -142,15 +158,22 @@ static void push_waterfall_latest(const monitor_t& mon) {
     const int freq_osr = mon.wf.freq_osr;
     const uint8_t* base = mon.wf.mag + block * mon.wf.block_stride;
 
-    static uint8_t collapsed[480];  // max num_bins
-    memset(collapsed, 0, num_bins);
-    for (int b = 0; b < num_bins; ++b) {
-        uint8_t v = 0;
-        for (int fs = 0; fs < freq_osr; ++fs) {
-            uint8_t val = base[fs * num_bins + b];
-            if (val > v) v = val;
+    const uint8_t* row_bins;     // pointer to `num_bins` bytes, one per FFT bin
+    if (freq_osr <= 1) {
+        row_bins = base;          // already single-band, zero-copy
+    } else {
+        // Rare path (not used in current 6 kHz config). Keep the merge
+        // buffer function-local so freq_osr=1 doesn't pay for BSS.
+        static uint8_t collapsed[480];
+        for (int b = 0; b < num_bins; ++b) {
+            uint8_t v = 0;
+            for (int fs = 0; fs < freq_osr; ++fs) {
+                uint8_t val = base[fs * num_bins + b];
+                if (val > v) v = val;
+            }
+            collapsed[b] = v;
         }
-        collapsed[b] = v;
+        row_bins = collapsed;
     }
 
     constexpr int width = UAC_WATERFALL_ROW_WIDTH;
@@ -161,7 +184,7 @@ static void push_waterfall_latest(const monitor_t& mon) {
         if (end <= start) end = start + 1;
         uint8_t maxv = 0;
         for (int s = start; s < end && s < num_bins; ++s) {
-            if (collapsed[s] > maxv) maxv = collapsed[s];
+            if (row_bins[s] > maxv) maxv = row_bins[s];
         }
         scaled[x] = maxv;
     }
@@ -171,6 +194,17 @@ static void push_waterfall_latest(const monitor_t& mon) {
     memcpy(s_latest_waterfall_row, scaled, width);
     s_latest_waterfall_row_valid = true;
     taskEXIT_CRITICAL(&s_latest_waterfall_row_lock);
+
+    // Stubbed swr/pwr/ptt until real polling lands (see
+    // NATIVE_CLIENT_ARCHITECTURE.md). row_bins points into mon.wf.mag
+    // (zero-copy) so the callback receives a pointer into authoritative
+    // waterfall storage — valid until the next slot boundary.
+    static int wf_log_counter = 0;
+    if ((wf_log_counter++ % 60) == 0) {
+        ESP_LOGI(TAG, "push_waterfall_latest: block=%d num_bins=%d", block, num_bins);
+    }
+    core_fire_waterfall_row(block, row_bins, num_bins,
+                            /*swr=*/1.5f, /*pwr=*/2.0f, /*ptt=*/false);
 }
 
 // CDC-ACM helpers (CAT TX only)
@@ -529,12 +563,26 @@ static void uac_lib_task(void* arg) {
                     // Try to open companion CDC-ACM interface (CAT)
                     cdc_try_open();
 
-                    // Start the audio processing task
+                    // Start the audio processing task using a STATIC stack
+                    // (BSS) so task creation doesn't depend on finding a
+                    // contiguous 8 KB block in a fragmented heap.
                     if (s_stream_task_handle == NULL) {
-                        xTaskCreatePinnedToCore(stream_uac_task, "stream_uac",
-                                                STREAM_TASK_STACK_SIZE, NULL,
-                                                UAC_STREAM_TASK_PRIORITY,
-                                                &s_stream_task_handle, 1);
+                        static StackType_t  s_stream_task_stack[STREAM_TASK_STACK_SIZE / sizeof(StackType_t)];
+                        static StaticTask_t s_stream_task_tcb;
+                        size_t free_before = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+                        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+                        ESP_LOGI(TAG, "Pre-task-create heap: free=%u largest=%u",
+                                 (unsigned)free_before, (unsigned)largest);
+                        s_stream_task_handle = xTaskCreateStaticPinnedToCore(
+                            stream_uac_task, "stream_uac",
+                            STREAM_TASK_STACK_SIZE / sizeof(StackType_t), NULL,
+                            UAC_STREAM_TASK_PRIORITY,
+                            s_stream_task_stack, &s_stream_task_tcb, 1);
+                        if (!s_stream_task_handle) {
+                            ESP_LOGE(TAG, "stream_uac_task create FAILED "
+                                     "(static) free=%u largest=%u",
+                                     (unsigned)free_before, (unsigned)largest);
+                        }
                     }
 
                 } else if (evt.driver.event == UAC_HOST_DRIVER_EVENT_TX_CONNECTED) {
@@ -588,16 +636,17 @@ static void stream_uac_task(void* arg) {
     monitor_init(&mon, &mon_cfg);
     monitor_reset(&mon);
 
-    // Allocate buffers
-    uint8_t* usb_buffer = (uint8_t*)heap_caps_malloc(UAC_READ_BUFFER_SIZE, MALLOC_CAP_DEFAULT);
-    float* ft8_buffer = (float*)heap_caps_malloc(sizeof(float) * mon.block_size, MALLOC_CAP_DEFAULT);
-    // Intermediate 6kHz output buffer from PCM conversion/resampling.
-    float* temp_dec = (float*)heap_caps_malloc(sizeof(float) * 512, MALLOC_CAP_DEFAULT);
+    // USB buffer lives in DMA-capable BSS (s_usb_buffer above). Only the
+    // float working buffers are heap-allocated; they don't need DMA capability.
+    uint8_t* usb_buffer = s_usb_buffer;
+    float*   ft8_buffer = (float*)heap_caps_malloc(sizeof(float) * mon.block_size,
+                                                   MALLOC_CAP_DEFAULT);
+    float*   temp_dec   = (float*)heap_caps_malloc(sizeof(float) * 512,
+                                                   MALLOC_CAP_DEFAULT);
     log_heap("UAC_AFTER_FFT_ALLOC");
-
-    if (!usb_buffer || !ft8_buffer || !temp_dec) {
-        ESP_LOGE(TAG, "Buffer allocation failed");
-        if (usb_buffer) free(usb_buffer);
+    if (!ft8_buffer || !temp_dec) {
+        ESP_LOGE(TAG, "Buffer allocation failed: ft8=%p temp=%p",
+                 ft8_buffer, temp_dec);
         if (ft8_buffer) free(ft8_buffer);
         if (temp_dec) free(temp_dec);
         monitor_free(&mon);
@@ -746,8 +795,7 @@ static void stream_uac_task(void* arg) {
         }
     }
 
-    // Cleanup
-    free(usb_buffer);
+    // Cleanup — usb_buffer is static BSS, no free.
     free(ft8_buffer);
     free(temp_dec);
     monitor_free(&mon);
@@ -842,6 +890,10 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
 
 bool uac_start(void) {
     return uac_start_with_profile(UAC_PROFILE_QMX);
+}
+
+bool uac_qmx_detected(void) {
+  return s_mic_handle != NULL || s_cdc_handle != NULL;
 }
 
 void uac_stop(void) {

@@ -50,6 +50,11 @@ bool uac_start_with_profile(uac_stream_profile_t profile);
 // Call when exiting Host mode
 void uac_stop(void);
 
+// True once the USB host stack has enumerated either the QMX UAC mic
+// (audio source) or the QMX CDC-ACM endpoint (CAT). Useful for the
+// "no QMX in N seconds → fall back" timer in app_task_core0.
+bool uac_qmx_detected(void);
+
 // Get current device info as a status string
 // Returns pointer to static buffer, do not free
 const char* uac_get_status_string(void);

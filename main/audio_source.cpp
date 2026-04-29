@@ -44,6 +44,10 @@ bool audio_source_is_streaming(void) {
     return uac_is_streaming();
 }
 
+bool audio_source_qmx_detected(void) {
+    return uac_qmx_detected();
+}
+
 const char* audio_source_get_status_string(void) {
     return uac_get_status_string();
 }

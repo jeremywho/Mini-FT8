@@ -15,6 +15,7 @@ static float* window_buf = NULL;
 static float* last_frame_buf = NULL;
 static WF_ELEM_T* waterfall_mag_buf = NULL;
 static uint8_t* fft_work_buf = NULL;
+static bool fft_work_is_static = false;
 
 static float hann_i(int i, int N)
 {
@@ -91,13 +92,29 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
     LOG(LOG_INFO, "Block size = %d\n", me->block_size);
     LOG(LOG_INFO, "Subblock size = %d\n", me->subblock_size);
 
-    // Allocate FFT work buffer first (largest transient block)
+    // FFT work buffer — use a static buffer in BSS to avoid heap
+    // fragmentation. For nfft=960 (6 kHz, freq_osr=1), kiss_fftr needs
+    // ~10 KB contiguous; the heap often can't provide that once NimBLE
+    // and USB-host have done their setup. A static 12 KB arena is
+    // plenty and adds 12 KB to BSS (was coming out of heap anyway).
+    static uint8_t fft_work_static[12288];
     size_t fft_needed = 0;
     kiss_fftr_alloc(me->nfft, 0, NULL, &fft_needed);
-    fft_work_buf = (uint8_t*)malloc(fft_needed);
+    if (fft_needed <= sizeof(fft_work_static))
+    {
+        fft_work_buf = fft_work_static;
+        fft_work_is_static = true;
+        LOG(LOG_INFO, "FFT plan using static buffer (%zu / %zu bytes)\n",
+            fft_needed, sizeof(fft_work_static));
+    }
+    else
+    {
+        fft_work_buf = (uint8_t*)malloc(fft_needed);
+        fft_work_is_static = false;
+    }
     if (fft_work_buf == NULL || fft_plan_init_with_buffer(&me->fft_plan, me->nfft, fft_work_buf, fft_needed) != 0)
     {
-        LOG(LOG_ERROR, "FFT plan init failed\n");
+        LOG(LOG_ERROR, "FFT plan init failed (needed %zu)\n", fft_needed);
         return;
     }
 
@@ -172,7 +189,11 @@ void monitor_free(monitor_t* me)
     // window_buf and last_frame_buf are static arrays — just NULL the pointers
     window_buf = NULL;
     last_frame_buf = NULL;
-    if (fft_work_buf) { free(fft_work_buf); fft_work_buf = NULL; }
+    if (fft_work_buf && !fft_work_is_static) {
+        free(fft_work_buf);
+    }
+    fft_work_buf = NULL;
+    fft_work_is_static = false;
 }
 
 void monitor_reset(monitor_t* me)

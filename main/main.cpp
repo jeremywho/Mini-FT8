@@ -21,6 +21,8 @@ extern "C" {
 #include "freertos/queue.h"
 #include "esp_heap_caps.h"
 #include "autoseq.h"
+#include "core_api.h"
+#include "core_api_internal.h"
 #include <M5Cardputer.h>
 #include <sstream>
 #include <iterator>
@@ -77,6 +79,7 @@ static bool g_ble_enabled = true;
 #include "soc/soc_caps.h"
 #include "esp_bt.h"
 #include "esp_mac.h"
+#include "ble_native.h"
 
 #endif
 #ifndef FT8_SAMPLE_RATE
@@ -324,21 +327,16 @@ static void init_bluetooth(void)
     ble_svc_gatt_init();
     ESP_LOGI(BT_TAG, "GAP/GATT init done");
 
-    ble_cmd_queue = xQueueCreate(32, sizeof(BleUiInput));
-    assert(ble_cmd_queue);
     ble_update_name_from_station(false);
 
-    rc = ble_gatts_count_cfg(gatt_svcs);
-    if (rc != 0) {
-        ESP_LOGE(BT_TAG, "ble_gatts_count_cfg failed: %d", rc);
+    // Register the native client GATT service (handles its own count_cfg + add_svcs).
+    // The former text-terminal service was removed; the mobile app is the
+    // only BLE client now.
+    if (!ble_native_init()) {
+        ESP_LOGE(BT_TAG, "ble_native_init failed");
         return;
     }
-    rc = ble_gatts_add_svcs(gatt_svcs);
-    if (rc != 0) {
-        ESP_LOGE(BT_TAG, "ble_gatts_add_svcs failed: %d", rc);
-        return;
-    }
-    ESP_LOGI(BT_TAG, "Services added");
+    ESP_LOGI(BT_TAG, "Native BLE service registered");
 
     ble_hs_cfg.sync_cb = ble_on_sync;
 
@@ -372,6 +370,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
             g_ble_indicate_waiting = false;
             g_ble_indicate_status = 0;
             g_ble_att_mtu = 23;
+            ble_native_on_connect(g_conn_handle);
             ESP_LOGI(BT_TAG, "Connected, handle=%u", g_conn_handle);
         } else {
             g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -398,6 +397,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
         g_ble_indicate_status = 0;
         g_ble_att_mtu = 23;
         if (ble_cmd_queue) xQueueReset(ble_cmd_queue);
+        ble_native_on_disconnect();
         ESP_LOGW(BT_TAG, "Disconnected; restarting adv");
         ble_app_advertise();
         break;
@@ -411,6 +411,11 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
                      g_ble_tx_notify_enabled ? 1 : 0,
                      g_ble_tx_indicate_enabled ? 1 : 0);
         }
+        // Forward all subscribe events to the native server — it tracks
+        // its own characteristic handles and ignores unrelated events.
+        ble_native_on_subscribe(event->subscribe.attr_handle,
+                                event->subscribe.cur_notify != 0,
+                                event->subscribe.cur_indicate != 0);
         break;
 
     case BLE_GAP_EVENT_NOTIFY_TX:
@@ -429,6 +434,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_MTU:
         if (event->mtu.conn_handle == g_conn_handle && event->mtu.value > 0) {
             g_ble_att_mtu = event->mtu.value;
+            ble_native_on_mtu(event->mtu.value);
             ESP_LOGI(BT_TAG, "ATT MTU=%u", (unsigned)g_ble_att_mtu);
         }
         break;
@@ -723,7 +729,13 @@ static CopyLogsResult copy_logs_spiffs_to_sd_overwrite() {
   return result;
 }
 
-#define CALLSIGN_HASHTABLE_SIZE 256
+// 128 entries × 16 bytes = 2 KB of BSS. 256 was the original size but
+// well over typical working set (FT8 rarely sees >50 unique hashed
+// callsigns in an active period; the aging + eviction logic keeps it
+// fresh). Reducing by 2 KB gives the USB DMA buffer (4608 bytes) a
+// better chance at finding a contiguous block after BLE+USB host
+// fragmentation.
+#define CALLSIGN_HASHTABLE_SIZE 128
 
 static struct
 {
@@ -962,19 +974,18 @@ volatile bool g_cdc_initial_sync_pending = false;
 
 // State machine variables (matching reference project architecture)
 // TX is scheduled by setting these flags; actual TX starts at slot boundary
-static volatile bool g_qso_xmit = false;        // TX is pending
-static volatile int g_target_slot_parity = 0;   // 0=even, 1=odd - parity of slot to TX on
+// Global TX-arming state: read by tx_tick on the next slot boundary.
+// Non-static so core_api.cpp can arm it from the BLE tap_rx RPC, matching
+// what the Cardputer's RX-key handler does inline.
+volatile bool g_qso_xmit = false;        // TX is pending
+volatile int g_target_slot_parity = 0;   // 0=even, 1=odd - parity of slot to TX on
 static volatile bool g_was_txing = false;       // We were transmitting (for tick timing)
 volatile bool g_decode_in_progress = false; // Block TX trigger while decoding
 static int g_last_slot_parity = -1;             // For slot boundary detection (just parity, like reference)
 
-//enum class BeaconMode { OFF = 0, EVEN, EVEN2, ODD, ODD2 };
-enum class BeaconMode { OFF = 0, EVEN, ODD };
-struct BandItem {
-  const char* name;
-  int freq;
-};
-static std::vector<BandItem> g_bands = {
+// BeaconMode and BandItem now defined in station_types.h
+#include "station_types.h"
+std::vector<BandItem> g_bands = {   // visible to core_api.cpp
     {"160m", 1840},   {"80m", 3573},   {"60m", 5357},   {"40m", 7074},
     {"30m", 10136},   {"20m", 14074},  {"17m", 18100},  {"15m", 21074},
     {"12m", 24915},   {"10m", 28074},  {"6m", 50313},   {"2m", 144174},
@@ -984,16 +995,15 @@ static std::vector<int> g_active_band_indices;
 static int band_page = 0;
 static int band_edit_idx = -1;       // absolute index into g_bands
 static std::string band_edit_buffer; // text while editing
-static void update_autoseq_cq_type();
-static void update_autoseq_cq_type();
-static BeaconMode g_beacon = BeaconMode::OFF;
-static int g_offset_hz = 1500;
-static int g_band_sel = 1; // default 80m
+void update_autoseq_cq_type();  // visible to core_api.cpp
+BeaconMode g_beacon = BeaconMode::OFF;   // visible to core_api.cpp
+int g_offset_hz = 1500;                  // visible to core_api.cpp
+int g_band_sel = 1; // default 80m       // visible to core_api.cpp
 static bool g_tune = false;
 static BeaconMode g_status_beacon_temp = BeaconMode::OFF;
 [[maybe_unused]] static bool g_cat_toggle_high = false;
-static std::string g_date = "2025-12-11";
-static std::string g_time = "10:10:00";
+std::string g_date = "2025-12-11";      // visible to core_api.cpp
+std::string g_time = "10:10:00";        // visible to core_api.cpp
 static int status_edit_idx = -1;     // 0-5
 static std::string status_edit_buffer;
 static int status_cursor_pos = -1;
@@ -1010,11 +1020,17 @@ static bool g_ble_dump_in_progress = false;
 static UIMode g_ble_qso_return_mode = UIMode::RX;
 
 static void host_handle_line(const std::string& line);
-static void save_station_data();
+void save_station_data();  // visible to core_api.cpp
 // TX entry for display and scheduling (populated by autoseq)
-static AutoseqTxEntry g_pending_tx;
-static bool g_pending_tx_valid = false;
-static volatile bool g_tx_cancel_requested = false;
+// Non-static for the same reason as g_qso_xmit / g_target_slot_parity
+// above — core_api.cpp's tap_rx RPC arms these on user-pick events.
+AutoseqTxEntry g_pending_tx;
+bool g_pending_tx_valid = false;
+
+// Forward declarations — definitions live near check_slot_boundary, where
+// g_offset_src has been declared.
+void arm_pending_tx(const AutoseqTxEntry& pending);
+volatile bool g_tx_cancel_requested = false;   // visible to core_api.cpp
 static void host_process_bytes(const uint8_t* buf, size_t len);
 static void poll_host_uart();
 static bool ble_pop_input(BleUiInput& out);
@@ -1025,8 +1041,8 @@ static void enter_mode(UIMode new_mode);
 static void apply_ble_enabled_policy(bool runtime_apply);
 static std::string menu_sleep_batt_line();
 static int normalize_gps_baud_value(int value);
-static bool rtc_set_from_strings();
-static void rtc_sync_to_hw();
+bool rtc_set_from_strings();   // visible to core_api.cpp
+void rtc_sync_to_hw();         // visible to core_api.cpp
 static bool g_rx_dirty = false;
 #if ENABLE_BLE
 static void ble_enter_text_mode();
@@ -1062,8 +1078,12 @@ static std::vector<std::string> g_startup_lines = {
     "  By N6HAN & AG6AQ "
 };
 
-// Runtime latch: when true, we keep showing the startup screen until any key is pressed.
-static bool g_startup_active = true;
+// Runtime latch: when true, we're still showing the startup screen. Either
+// a keypress or the 1 s auto-dismiss timer (g_startup_start_ms) takes us
+// out.
+static bool    g_startup_active  = true;
+static int64_t g_startup_start_ms = 0;    // set on the first tick we see in the splash branch
+static constexpr int64_t kStartupAutoDismissMs = 1000;
 
 static bool is_startup_direct_mode_key(char c) {
   const char k = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
@@ -1135,27 +1155,25 @@ static bool rtc_valid = false;
 // rtc_comp is seconds per 10000 seconds and can be adjusted via MENU O page.
 static constexpr int kRtcCompFixed = 120;
 static time_t g_rtc_sleep_epoch = 0;
-static int g_rtc_comp = kRtcCompFixed;
+int g_rtc_comp = kRtcCompFixed;        // visible to core_api.cpp
 static int clamp_rtc_comp_value(int value) {
   if (value < -9000) return -9000;
   if (value > 9000) return 9000;
   return value;
 }
 
-enum class CqType { CQ, CQSOTA, CQPOTA, CQQRP, CQFD, CQFREETEXT };
-enum class OffsetSrc { RANDOM, CURSOR, RX };
-enum class RadioType { NONE, TRUSDX, QMX, KH1 };
+// CqType, OffsetSrc, RadioType now defined in station_types.h
 struct RadioProfileBinding {
   audio_source_backend_t audio_backend;
   radio_control_backend_t radio_backend;
 };
-static CqType g_cq_type = CqType::CQ;
-static std::string g_cq_freetext = "FreeText";
-static bool g_skip_tx1 = false;
-static int g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;
+CqType g_cq_type = CqType::CQ;                // visible to core_api.cpp
+std::string g_cq_freetext = "FreeText";       // visible to core_api.cpp
+bool g_skip_tx1 = false;                      // visible to core_api.cpp
+int g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;  // visible to core_api.cpp
 static std::string g_free_text = "TNX 73";
-static std::string g_call = "YOURCALL";
-static std::string g_grid = "CM97";
+std::string g_call = "YOURCALL";   // visible to core_api.cpp
+std::string g_grid = "CM97";       // visible to core_api.cpp
 static std::string g_grid_saved_manual = "CM97";
 static bool g_grid_from_gps = false;
 static bool g_time_synced_from_gps = false;
@@ -1163,22 +1181,24 @@ static std::string g_grid_gps_display8;
 bool g_decode_enabled = true;
 int g_time_osr = 2;
 int g_freq_osr = 1;
-static OffsetSrc g_offset_src = OffsetSrc::RANDOM;
-static RadioType g_radio = RadioType::QMX;
+OffsetSrc g_offset_src = OffsetSrc::RANDOM;  // visible to core_api.cpp
+RadioType g_radio = RadioType::QMX;          // visible to core_api.cpp
 static bool g_kh1_connected = false;
 static int g_gps_baud = 115200;
 static constexpr size_t kIgnorePrefixTextMaxLen = 64;
-static std::string g_comment1 = "MiniFT8 /Radio";
+std::string g_comment1 = "MiniFT8 /Radio";      // visible to core_api.cpp
 static std::string g_ignore_prefix_text;
-static std::vector<std::string> g_ignore_prefixes;
+std::vector<std::string> g_ignore_prefixes;     // visible to core_api.cpp
 static bool g_rxtx_log = true;
 static RadioType canonical_radio_type(RadioType r);
 static RadioProfileBinding get_radio_profile_binding(RadioType r);
-static void apply_radio_profile_binding();
+void apply_radio_profile_binding();   // visible to core_api.cpp
 static void gps_runtime_tick();
 static std::string expand_comment_macros(const std::string& src);
 static std::string normalize_grid_maidenhead(const std::string& src);
-static std::string grid_ft8_4(const std::string& grid);
+// Non-static so core_api.cpp's set_call / set_grid RPCs can refresh the
+// autoseq station info exactly like the on-device MENU/STATUS edits do.
+std::string grid_ft8_4(const std::string& grid);
 // Single-threaded TX state machine (replaces separate tx_send_task)
 // TX runs in main loop via tx_tick(), one tone at a time
 static bool g_tx_active = false;           // TX state machine is running
@@ -1216,7 +1236,9 @@ static void draw_status_line(int idx, const std::string& text, bool highlight);
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
 static void update_countdown();
 static void consume_cdc_initial_sync();
-static bool sync_radio_to_current_band(const char* reason);
+// Non-static so core_api.cpp's BLE set_band RPC can push the CAT change
+// immediately, matching what the Cardputer's STATUS-exit path does.
+bool sync_radio_to_current_band(const char* reason);
 static void menu_flash_tick();
 static void rx_flash_tick();
 #if ENABLE_BLE
@@ -1225,7 +1247,7 @@ static uint8_t g_own_addr_type;
 static bool looks_like_grid(const std::string& s);
 static bool looks_like_report(const std::string& s, int& out);
 static std::string g_last_reply_text;
-static void rebuild_active_bands();
+void rebuild_active_bands();   // visible to core_api.cpp
 static void schedule_tx_if_idle();
 static int64_t s_last_tx_slot_idx = -1000;  // Track last TX slot for retry scheduling
 [[maybe_unused]] static bool g_sync_pending = false;
@@ -1793,6 +1815,56 @@ static void host_write_str(const std::string& s) {
   }
 }
 
+// ================================================================
+// UART screen mirror
+//
+// Debug aid for headless boards (e.g. StampS3Bat): every time a
+// keystroke arrives over the console UART, dump the text that would
+// have been displayed on the Cardputer LCD to the same UART TX, so
+// a terminal shows the current page contents.
+//
+// To disable: comment out the `#define UART_SCREEN_MIRROR 1` below.
+// ================================================================
+#define UART_SCREEN_MIRROR 1
+
+#if UART_SCREEN_MIRROR
+static volatile bool g_uart_mirror_pending = false;
+
+static const char* uart_mirror_mode_label(UIMode mode) {
+  switch (mode) {
+    case UIMode::RX:      return "RX";
+    case UIMode::TX:      return "TX";
+    case UIMode::BAND:    return "BAND";
+    case UIMode::MENU:    return "MENU";
+    case UIMode::CONTROL: return "CONTROL";
+    case UIMode::DEBUG:   return "DEBUG";
+    case UIMode::STATUS:  return "STATUS";
+    case UIMode::QSO:     return "QSO";
+    case UIMode::GPS:     return "GPS";
+  }
+  return "?";
+}
+
+static void uart_mirror_dump_screen() {
+  std::vector<std::string> lines;
+  ui_get_visible_text_lines(lines);
+
+  // RX mode has proper paging info; other modes fall back to "page 1/1".
+  int cur = 1, total = 1;
+  if (ui_mode == UIMode::RX) {
+    ui_get_rx_page_info(cur, total);
+  }
+
+  const char* label = uart_mirror_mode_label(ui_mode);
+  printf("\n---- [%s %d/%d] ----\n", label, cur, total);
+  for (size_t i = 0; i < lines.size(); ++i) {
+    printf("%s\n", lines[i].c_str());
+  }
+  printf("--------------------\n");
+  fflush(stdout);
+}
+#endif  // UART_SCREEN_MIRROR
+
 struct WAVHeader {
   char riff[4];
   uint32_t file_size;
@@ -2003,7 +2075,7 @@ static const char* radio_name(RadioType r) {
   return "None";
 }
 
-static void apply_radio_profile_binding() {
+void apply_radio_profile_binding() {
   audio_source_backend_t prev_audio = audio_source_get_backend();
   g_radio = canonical_radio_type(g_radio);
   g_gps_baud = normalize_gps_baud_value(g_gps_baud);
@@ -2203,7 +2275,7 @@ static std::string expand_comment1() {
   return expand_comment_macros(g_comment1);
 }
 
-static void rebuild_ignore_prefixes() {
+void rebuild_ignore_prefixes() {
   g_ignore_prefixes.clear();
   std::istringstream iss(g_ignore_prefix_text);
   std::string tok;
@@ -2334,7 +2406,7 @@ static std::string normalize_grid_maidenhead(const std::string& src) {
   return out;
 }
 
-static std::string grid_ft8_4(const std::string& grid) {
+std::string grid_ft8_4(const std::string& grid) {
   const std::string norm = normalize_grid_maidenhead(grid);
   if (norm.size() >= 4) return norm.substr(0, 4);
   return "CM97";
@@ -2375,7 +2447,7 @@ static std::string highlight_pos(const std::string& s, int pos) {
 
 static void draw_status_view();
 
-static bool rtc_set_from_strings() {
+bool rtc_set_from_strings() {
   int y, M, d, h, m, s;
   if (sscanf(g_date.c_str(), "%d-%d-%d", &y, &M, &d) != 3) return false;
   if (sscanf(g_time.c_str(), "%d:%d:%d", &h, &m, &s) != 3) return false;
@@ -2453,7 +2525,7 @@ static bool rtc_init_from_hw() {
 }
 
 // Sync hardware RTC from soft RTC (call after FT8 time sync)
-static void rtc_sync_to_hw() {
+void rtc_sync_to_hw() {
   if (!rtc_valid) return;
 
   time_t now = rtc_epoch_base + (esp_timer_get_time() / 1000 - rtc_ms_start) / 1000;
@@ -2514,7 +2586,7 @@ static void rtc_tick() {
 // Returns true on success. Callers can use the return value to decide
 // whether to clear a deferred-sync flag.
 // The `reason` string is logged for debugging.
-static bool sync_radio_to_current_band(const char* reason) {
+bool sync_radio_to_current_band(const char* reason) {
   if (!radio_control_ready()) return false;
   if (g_tx_active) return false;
   int freq_hz = g_bands[g_band_sel].freq * 1000;
@@ -2577,6 +2649,38 @@ static void tx_tick();
 
 // Slot boundary check - called from main loop
 // Matches reference project: tick after TX slot ends, TX trigger at slot start
+// Compute the actual audio offset the next TX will use, given the
+// configured g_offset_src and the autoseq pending entry. Storing the
+// resolved value at scheduling time (rather than at the slot boundary,
+// as the firmware used to do) means BLE clients reading core_get_qso
+// see the same number that will actually go on air — important for the
+// waterfall offset marker, especially in RANDOM / beacon-CQ modes where
+// the random was previously rolled inside check_slot_boundary.
+static int resolve_tx_offset(const AutoseqTxEntry& e) {
+  if (g_offset_src == OffsetSrc::CURSOR) {
+    return g_offset_hz;
+  }
+  if (g_offset_src == OffsetSrc::RX &&
+      e.offset_hz > 0 &&
+      e.text.rfind("CQ ", 0) != 0) {
+    return e.offset_hz;
+  }
+  // RANDOM, or RX mode + CQ: roll a fresh offset in [500, 2500] Hz.
+  return 500 + (int)(esp_random() % 2001);
+}
+
+// Single point of truth for arming the next TX. Replaces the 4-line
+// "g_qso_xmit / g_target_slot_parity / g_pending_tx / g_pending_tx_valid"
+// block that used to be repeated at every scheduling site (autoseq tick,
+// beacon-on, freetext queue, BLE tap_rx, …).
+void arm_pending_tx(const AutoseqTxEntry& pending) {
+  g_qso_xmit           = true;
+  g_target_slot_parity = pending.slot_id & 1;
+  g_pending_tx         = pending;
+  g_pending_tx.offset_hz = resolve_tx_offset(g_pending_tx);
+  g_pending_tx_valid   = true;
+}
+
 static void check_slot_boundary() {
   int64_t now_ms = rtc_now_ms();
   int64_t slot_idx = now_ms / 15000;
@@ -2595,7 +2699,7 @@ static void check_slot_boundary() {
              (long long)slot_idx, slot_parity);
     autoseq_tick(slot_idx, slot_parity, 0);
     g_was_txing = false;
-    g_tx_view_dirty = true;
+    core_fire_qso_changed();  // propagates to all registered consumers
   }
 
   // TX trigger: check if we should start TX in this slot
@@ -2627,20 +2731,10 @@ static void check_slot_boundary() {
         g_qso_xmit = false;  // Clear flag only AFTER validation succeeds
         g_was_txing = true;  // Set IMMEDIATELY when TX starts (prevents decode_monitor_results from re-setting flags)
 
-        // Compute actual TX offset now (before logging) based on offset_src setting
-        int actual_offset;
-        if (g_offset_src == OffsetSrc::CURSOR) {
-          actual_offset = g_offset_hz;
-        } else if (g_offset_src == OffsetSrc::RX &&
-                   g_pending_tx.offset_hz > 0 &&
-                   g_pending_tx.text.rfind("CQ ", 0) != 0) {
-          actual_offset = g_pending_tx.offset_hz;
-        } else {
-          // RANDOM mode or CQ in RX mode: generate random offset
-          actual_offset = 500 + (int)(esp_random() % 2001);
-        }
-        g_pending_tx.offset_hz = actual_offset;  // Store for tx_start to use
-        log_rxtx_line('T', 0, actual_offset, g_pending_tx.text, g_pending_tx.repeat_counter);
+        // Offset was resolved at scheduling time by arm_pending_tx, so
+        // g_pending_tx.offset_hz is already what's going on air.
+        log_rxtx_line('T', 0, g_pending_tx.offset_hz, g_pending_tx.text,
+                      g_pending_tx.repeat_counter);
         tx_start(skip_tones);
       }
     }
@@ -2684,7 +2778,7 @@ static int band_number_from_name(const std::string& name) {
   return num;
 }
 
-static void rebuild_active_bands() {
+void rebuild_active_bands() {
   std::string cleaned = g_active_band_text;
   for (char& c : cleaned) {
     if (c == ',' || c == '/' || c == '\\' || c == ';') c = ' ';
@@ -2722,7 +2816,7 @@ static void rebuild_active_bands() {
   g_active_band_text = oss.str();
 }
 
-static void update_autoseq_cq_type() {
+void update_autoseq_cq_type() {
   AutoseqCqType t = AutoseqCqType::CQ;
   switch (g_cq_type) {
     case CqType::CQSOTA: t = AutoseqCqType::SOTA; break;
@@ -2957,7 +3051,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     ESP_LOGW(TAG, "No candidates found");
     ui_set_rx_list_static(nullptr, 0);
     if (update_ui) { ui_draw_rx(); }
-    else g_rx_dirty = true;
+    else core_fire_rx_changed();  // propagates to all registered consumers (Cardputer, future BLE)
     ble_publish_decode_event(0);
     // No candidates means we processed the slot's audio but found nothing —
     // still counts as "applied" for the TX-trigger guard.
@@ -3134,24 +3228,18 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 
     if (!to_me_auto.empty()) {
       autoseq_on_decodes(to_me_auto);
-      g_tx_view_dirty = true;
+      core_fire_qso_changed();  // propagates to all registered consumers
       g_last_reply_text = to_me_auto.front().text;
     }
 
     AutoseqTxEntry pending;
     if (autoseq_fetch_pending_tx(pending)) {
-      g_qso_xmit = true;
-      g_target_slot_parity = pending.slot_id & 1;
-      g_pending_tx = pending;
-      g_pending_tx_valid = true;
+      arm_pending_tx(pending);
       ESP_LOGI(TAG, "TX ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
     } else if (g_beacon != BeaconMode::OFF) {
       enqueue_beacon_cq();
       if (autoseq_fetch_pending_tx(pending)) {
-        g_qso_xmit = true;
-        g_target_slot_parity = pending.slot_id & 1;
-        g_pending_tx = pending;
-        g_pending_tx_valid = true;
+        arm_pending_tx(pending);
         ESP_LOGI(TAG, "Beacon CQ ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
       }
     }
@@ -3166,7 +3254,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     snprintf(buf, sizeof(buf), "Heap %u", heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
     debug_log_line(buf);
   } else {
-    g_rx_dirty = true;
+    core_fire_rx_changed();  // propagates to all registered consumers (Cardputer, future BLE)
   }
   ble_publish_decode_event(s_dec_count);
 
@@ -3270,7 +3358,7 @@ static void encode_and_log_pending_tx() {
 static void enqueue_beacon_cq() {
   int target_parity = (g_beacon == BeaconMode::EVEN) ? 0 : 1;
   autoseq_start_cq(target_parity);
-  g_tx_view_dirty = true;
+  core_fire_qso_changed();  // propagates to all registered consumers
 }
 
 static bool autoseq_has_pending_tx() {
@@ -3287,18 +3375,9 @@ static bool schedule_manual_pending_tx(const AutoseqTxEntry& pending) {
     return false;
   }
 
-  int target_parity = pending.slot_id & 1;
-
-  // Set up pending TX
-  g_pending_tx = pending;
-  g_pending_tx_valid = true;
-
-  // Set flags for check_slot_boundary() to trigger TX
-  g_qso_xmit = true;
-  g_target_slot_parity = target_parity;
-
+  arm_pending_tx(pending);
   ESP_LOGI(TAG, "schedule_manual_pending_tx: queued TX=%s for parity=%d",
-           pending.text.c_str(), target_parity);
+           pending.text.c_str(), g_target_slot_parity);
   return true;
 }
 
@@ -3418,7 +3497,7 @@ static void tx_tick() {
     g_pending_tx_valid = false;
     g_tx_cancel_requested = false;
     g_was_txing = false;  // TX was cancelled - don't call tick at slot boundary
-    g_tx_view_dirty = true;
+    core_fire_qso_changed();  // propagates to all registered consumers
     return;
   }
 
@@ -3441,7 +3520,7 @@ static void tx_tick() {
     g_tx_active = false;
     g_pending_tx_valid = false;
     g_tx_cancel_requested = false;
-    g_tx_view_dirty = true;
+    core_fire_qso_changed();  // propagates to all registered consumers
     return;
   }
 
@@ -4199,6 +4278,12 @@ static bool ble_gps_clock_only_delta(const std::vector<std::string>& lines,
 }
 
 static void ble_mirror_tick() {
+  // Text-terminal screen mirror is removed. The native BLE service
+  // (ble_native.cpp) now pushes state changes via its own EVENTS /
+  // RX_LIST / QSO_QUEUE / RADIO_STREAM characteristics.
+  return;
+  // Dead code below kept temporarily for reference; will be pruned
+  // once step 5 confirms no regressions. Unreachable, zero cost.
   if (!g_ble_enabled) return;
   if (g_ble_dump_in_progress) return;
   if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
@@ -4302,6 +4387,9 @@ static void ble_mirror_tick() {
 }
 
 static void ble_countdown_tick() {
+  // Terminal-mode countdown token removed; the native app derives the
+  // slot clock from its own RTC synced via set_rtc RPC.
+  return;
   if (!g_ble_enabled) return;
   if (g_ble_dump_in_progress) return;
   if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
@@ -4365,17 +4453,32 @@ static void ble_app_advertise(void) {
   adv.conn_mode = BLE_GAP_CONN_MODE_UND;
   adv.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
+  // Primary AD carries flags + the 128-bit service UUID so iOS can pre-filter
+  // (a custom 128-bit UUID + flags is already 21 of the 31 AD bytes, leaving
+  // no room for the name). The complete name travels in the scan response.
+  static ble_uuid128_t svc_uuid = BLE_UUID128_INIT(BLE_NATIVE_SVC_UUID);
+
   struct ble_hs_adv_fields fields{};
   fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+  fields.uuids128 = &svc_uuid;
+  fields.num_uuids128 = 1;
+  fields.uuids128_is_complete = 1;
+
   const std::string name = g_ble_adv_name.empty() ? std::string("Mini-FT8") : g_ble_adv_name;
-  fields.name = (uint8_t*)name.c_str();
-  fields.name_len = name.size();
-  fields.name_is_complete = 1;
+  struct ble_hs_adv_fields rsp_fields{};
+  rsp_fields.name = (uint8_t*)name.c_str();
+  rsp_fields.name_len = name.size();
+  rsp_fields.name_is_complete = 1;
 
   ble_gap_adv_stop();
   int rc = ble_gap_adv_set_fields(&fields);
   if (rc != 0) {
     ESP_LOGE(BT_TAG, "adv_set_fields failed: %d", rc);
+    return;
+  }
+  rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+  if (rc != 0) {
+    ESP_LOGE(BT_TAG, "adv_rsp_set_fields failed: %d", rc);
     return;
   }
   rc = ble_gap_adv_start(g_own_addr_type, nullptr, BLE_HS_FOREVER, &adv, gap_cb, nullptr);
@@ -4858,7 +4961,7 @@ static void load_station_data() {
   apply_ble_enabled_policy(false);
 }
 
-static void save_station_data() {
+void save_station_data() {
   FILE* f = fopen(STATION_FILE, "w");
   if (!f) {
     ESP_LOGE(TAG, "Failed to open %s for write", STATION_FILE);
@@ -4890,6 +4993,9 @@ static void save_station_data() {
   fprintf(f, "autoseq_max_retry=%d\n", g_autoseq_max_retry);
   fprintf(f, "ble_enabled=%d\n", g_ble_enabled ? 1 : 0);
   fclose(f);
+  // Every config mutation in the Cardputer UI funnels through here, so this
+  // is the canonical place to notify core_api consumers.
+  core_fire_config_changed();
 }
 
 static void enter_mode(UIMode new_mode) {
@@ -4901,7 +5007,7 @@ static void enter_mode(UIMode new_mode) {
       save_station_data();
       // No need to clear autoseq when beacon is turned off.
       // Any CQ in queue will transmit once, then tick moves CALLING→IDLE.
-      g_tx_view_dirty = true;
+      core_fire_qso_changed();  // propagates to all registered consumers
 
       // If beacon was just enabled, enqueue CQ and set TX flag
       // TX will trigger at next slot boundary via check_slot_boundary()
@@ -4909,10 +5015,7 @@ static void enter_mode(UIMode new_mode) {
         enqueue_beacon_cq();
         AutoseqTxEntry pending;
         if (autoseq_fetch_pending_tx(pending)) {
-          g_qso_xmit = true;
-          g_target_slot_parity = pending.slot_id & 1;
-          g_pending_tx = pending;
-          g_pending_tx_valid = true;
+          arm_pending_tx(pending);
         }
       }
     }
@@ -5155,6 +5258,85 @@ static void ble_commit_text_input(const BleUiInput& input) {
 }
 #endif
 
+// "No QMX in N seconds → fall back to USB Serial JTAG / CONTROL mode" timer.
+// Set when begin_usb_host_mode arms it; cleared once we either see a QMX
+// enumerate (mic or CDC handle) or after we've fallen back. Used by the
+// main loop's periodic check below.
+static bool    g_qmx_detect_active     = false;
+static int64_t g_qmx_detect_deadline_ms = 0;
+static constexpr int64_t kQmxDetectTimeoutMs = 10000;
+
+// Tear down the USB host stack and switch to CONTROL mode. usb_host_uninstall
+// (driven by audio_source_stop's synchronous teardown chain) releases the
+// USB-OTG bus, at which point the always-installed USB Serial JTAG driver
+// resumes ownership and the PC re-enumerates Mini-FT8 as a serial device.
+static void fall_back_to_control_mode(const char* reason) {
+  g_qmx_detect_active = false;
+  ESP_LOGI(TAG, "USB host fallback: %s — entering CONTROL", reason);
+  debug_log_line("No QMX -> CONTROL");
+  audio_source_stop();
+  // Small settle window so USB Serial JTAG fully reclaims the bus before
+  // host_handle_line starts pumping bytes through it.
+  vTaskDelay(pdMS_TO_TICKS(200));
+  enter_mode(UIMode::CONTROL);
+  ui_force_redraw_rx();
+}
+
+// Perform the STATUS -> '2' action: start the UAC audio source that feeds
+// the QMX (or KH1) into the decoder, and sync CAT to the currently selected
+// band. Shared between the on-device keypress path and the 1 s splash
+// auto-dismiss on boot.
+static void begin_usb_host_mode() {
+  // The status-view feedback only makes sense when we're actually on the
+  // STATUS page (manual S -> '2' path). The splash auto-dismiss lands on
+  // RX, so skip the status redraws to avoid painting over the RX view.
+  const bool on_status_page = (ui_mode == UIMode::STATUS);
+  if (on_status_page) {
+    status_edit_idx = 1;
+    draw_status_view();
+  }
+  if (canonical_radio_type(g_radio) == RadioType::KH1 && !g_kh1_connected) {
+    g_kh1_connected = true;
+    apply_radio_profile_binding();
+  }
+  if (!audio_source_is_streaming()) {
+    debug_log_line("UAC2 start");
+    apply_radio_profile_binding();
+    debug_log_line("UAC2 bind");
+    if (!audio_source_start()) {
+      debug_log_line("UAC2 afail");
+    } else {
+      debug_log_line("UAC2 aok");
+      g_decode_enabled = true;
+      ui_set_paused(false);
+      ui_clear_waterfall();
+      esp_err_t rc = radio_control_on_audio_start();
+      debug_log_line(rc == ESP_OK ? "UAC2 catok" : "UAC2 catng");
+      // Headless-friendly fallback: arm a 10 s "no-QMX" timer when the
+      // selected radio is QMX. If neither the UAC mic nor the CDC-ACM
+      // endpoint enumerates by then, the main loop calls audio_source_stop
+      // and drops into CONTROL so the PC sees the USB Serial JTAG terminal.
+      // Gated on QMX so a future "KH1 via Cardputer I2S mic" backend (which
+      // never enumerates a USB device) doesn't trip the fallback.
+      if (canonical_radio_type(g_radio) == RadioType::QMX) {
+        g_qmx_detect_deadline_ms = esp_timer_get_time() / 1000 + kQmxDetectTimeoutMs;
+        g_qmx_detect_active = true;
+      }
+    }
+  }
+  int freq_hz = g_bands[g_band_sel].freq * 1000;
+  if (radio_control_ready()) {
+    bool ok = (radio_control_sync_frequency_mode(freq_hz) == ESP_OK);
+    debug_log_line(ok ? "CAT sync sent" : "CAT sync failed");
+  } else {
+    debug_log_line("CAT not ready");
+  }
+  if (on_status_page) {
+    status_edit_idx = -1;
+    draw_status_view();
+  }
+}
+
 static void app_task_core0(void* /*param*/) {
   esp_vfs_spiffs_conf_t conf = {
     .base_path = "/spiffs",
@@ -5172,6 +5354,20 @@ static void app_task_core0(void* /*param*/) {
 
   // Initialize autoseq engine
   autoseq_init();
+
+  // Initialize the functional-core API (creates internal sync primitives).
+  // After this, core_api.h consumers (Cardputer UI, future BLE server) can
+  // safely call core_get_*, core_cmd_*, and register callbacks.
+  core_init();
+
+  // Register the Cardputer UI as a core_api consumer. The callbacks just set
+  // the existing dirty flags — the UI main loop drains them on each tick.
+  // Trivial handlers only (spec in docs/NATIVE_CLIENT_ARCHITECTURE.md).
+  core_on_rx_changed    ([]{ g_rx_dirty = true; });
+  core_on_qso_changed   ([]{ g_tx_view_dirty = true; });
+  // config changes redraw whatever view is showing them (MENU/STATUS);
+  // set both dirty flags so the next UI tick re-evaluates.
+  core_on_config_changed([]{ g_rx_dirty = true; g_tx_view_dirty = true; });
   
 // Cabrillo Field Day log callback (implemented in autoseq.cpp; declared here to avoid header churn)
 using CabrilloFdLogCallback = void (*)(const std::string& dxcall, const std::string& their_fd_exchange);
@@ -5222,14 +5418,17 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     debug_update_app_core0_stack_hud(false);
   }
 
-  // Key injection queue for console UART RX (G15)
+  // Key injection queue for console UART RX
   s_key_inject_queue = xQueueCreate(32, sizeof(char));
 
-  // sdkconfig puts the ESP console on UART0 peripheral with TX=G13,
+  // sdkconfig puts the ESP console on UART0 peripheral with a custom TX pin,
   // but IDF's custom-console init only guarantees the TX pin routing —
-  // it doesn't always hook up RX. Explicitly route G15 to UART0 RXD.
-  // This is a no-op if already set, and doesn't install a driver.
-  uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, GPIO_NUM_15,
+  // it doesn't always hook up RX. Explicitly route the configured RX GPIO
+  // to UART0 RXD. This is a no-op if already set, and doesn't install a
+  // driver. Using CONFIG_ESP_CONSOLE_UART_RX_GPIO keeps this in sync with
+  // sdkconfig automatically.
+  uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE,
+               (gpio_num_t)CONFIG_ESP_CONSOLE_UART_RX_GPIO,
                UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
   // Drain any stale bytes left in the FIFO from ROM-bootloader time
   // (when UART0 RX was still on its IO_MUX default pin, likely floating).
@@ -5259,15 +5458,32 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     } else if (state.enter) {
       c = '\n';  // enter/return
     }
-    // Merge injected keys from UART1 RX (console UART on G13/G15)
+    // Merge injected keys from console UART RX (G4/G5 per sdkconfig)
     poll_uart_inject_keys();
     if (c == 0 && s_key_inject_queue) {
       char injected = 0;
       if (xQueueReceive(s_key_inject_queue, &injected, 0) == pdTRUE) {
         c = injected;
         last_key = 0;  // Reset debounce so same-key injection works
+#if UART_SCREEN_MIRROR
+        g_uart_mirror_pending = true;  // dump screen at top of next iteration
+#endif
       }
     }
+
+#if UART_SCREEN_MIRROR
+    // Dump screen on the iteration AFTER a UART keypress was consumed,
+    // once the UI has had a chance to process the key and redraw.
+    static bool s_uart_mirror_fire = false;
+    if (s_uart_mirror_fire) {
+      uart_mirror_dump_screen();
+      s_uart_mirror_fire = false;
+    }
+    if (g_uart_mirror_pending) {
+      g_uart_mirror_pending = false;
+      s_uart_mirror_fire = true;  // fire on the next iteration
+    }
+#endif
     if (c == 0) {
       BleUiInput ble_input{};
       if (ble_pop_input(ble_input)) {
@@ -5303,33 +5519,48 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       }
       debug_update_app_core0_stack_hud(true);
     }
-    // Startup screen overlay on RX page: show until any key press, and only once
+    // Startup splash: show for kStartupAutoDismissMs, then auto-enter
+    // USB-host mode (= STATUS -> '2'). A direct-mode key during the splash
+    // window still short-circuits — most usefully 'c', which drops into the
+    // USB serial terminal instead of starting the QMX audio path.
     if (g_startup_active) {
-      if (c == 0) {
+      if (g_startup_start_ms == 0) {
+        g_startup_start_ms = esp_timer_get_time() / 1000;
+      }
+
+      if (c != 0 && c != last_key) {
+        const bool direct_mode_entry = is_startup_direct_mode_key(c);
+        g_startup_active = false;
+        save_station_data();
+        if (!direct_mode_entry) {
+          // Non-mode key: dismiss, show RX, consume the key.
+          last_key = c;
+          ui_force_redraw_rx();
+          ui_draw_rx();
+          vTaskDelay(pdMS_TO_TICKS(10));
+          continue;
+        }
+        // Direct-mode key: fall through so the main dispatcher handles it.
         last_key = 0;
+      } else {
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - g_startup_start_ms >= kStartupAutoDismissMs) {
+          // No key within the window — auto-start USB host mode and land
+          // on the RX page.
+          g_startup_active = false;
+          save_station_data();
+          enter_mode(UIMode::RX);
+          begin_usb_host_mode();
+          ui_force_redraw_rx();
+          ui_draw_rx();
+          last_key = 0;
+          vTaskDelay(pdMS_TO_TICKS(10));
+          continue;
+        }
+        last_key = c;  // 0 or the same key still held
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }
-      if (c == last_key) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        continue;
-      }
-      const bool direct_mode_entry = is_startup_direct_mode_key(c);
-
-      g_startup_active = false;
-      save_station_data();
-
-      if (!direct_mode_entry) {
-        // Non-mode startup dismissal keeps prior behavior: show RX and consume key.
-        last_key = c;
-        ui_force_redraw_rx();
-        ui_draw_rx();
-        vTaskDelay(pdMS_TO_TICKS(10));
-        continue;
-      }
-
-      // Let the first mode key both dismiss startup and perform normal mode switch.
-      last_key = 0;
     }
 
     rtc_tick();
@@ -5337,6 +5568,19 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     consume_cdc_initial_sync();  // auto-sync VFO on first QMX connect (every iter)
     check_slot_boundary();  // TX trigger at slot boundary (matching reference architecture)
     tx_tick();              // Process TX state machine (single-threaded, non-blocking)
+
+    // No-QMX fallback: if begin_usb_host_mode armed the timer and nothing
+    // has enumerated by the deadline, tear USB host down and switch to
+    // CONTROL so a button-less StampS3Bat can still expose the USB serial
+    // terminal to the host PC. Detection clears the timer immediately.
+    if (g_qmx_detect_active) {
+      if (audio_source_qmx_detected()) {
+        g_qmx_detect_active = false;
+        ESP_LOGI(TAG, "QMX detected; staying in USB host mode");
+      } else if (esp_timer_get_time() / 1000 >= g_qmx_detect_deadline_ms) {
+        fall_back_to_control_mode("no QMX after 10s");
+      }
+    }
 
   // CONTROL mode: legacy host serial protocol over USB only
   if (ui_mode == UIMode::CONTROL) {
@@ -5405,10 +5649,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     if (c == '`' &&
         (ui_mode == UIMode::RX || ui_mode == UIMode::TX || ui_mode == UIMode::STATUS) &&
         status_edit_idx == -1) {
-      g_tx_cancel_requested = true;
-      if (radio_control_ready()) {
-        radio_control_end_tx();
-      }
+      core_cmd_cancel_tx();  // routes through core_api — same effect, plus BLE notify
       debug_log_line("TX cancel requested");
       last_key = c;
       vTaskDelay(pdMS_TO_TICKS(10));
@@ -5595,31 +5836,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       case UIMode::GPS: break;
       case UIMode::RX: {
         int sel = ui_handle_rx_key(c);
-        RxDecodeEntry tapped;
-        if (sel >= 0 && ui_get_rx_entry(sel, &tapped)) {
-          // Convert static entry to UiRxLine for the autoseq API.
-          // This is on user tap (not in hot path), so the temporary
-          // std::string allocations are fine.
-          UiRxLine msg;
-          msg.text      = tapped.text;
-          msg.field1    = tapped.field1;
-          msg.field2    = tapped.field2;
-          msg.field3    = tapped.field3;
-          msg.snr       = tapped.snr;
-          msg.offset_hz = tapped.offset_hz;
-          msg.slot_id   = tapped.slot_id;
-          msg.is_cq     = tapped.is_cq;
-          msg.is_to_me  = tapped.is_to_me;
-          autoseq_on_touch(msg);
-          g_tx_view_dirty = true;
-          // Set TX flags - actual TX at slot boundary
-          AutoseqTxEntry pending;
-          if (autoseq_fetch_pending_tx(pending)) {
-            g_qso_xmit = true;
-            g_target_slot_parity = pending.slot_id & 1;
-            g_pending_tx = pending;
-            g_pending_tx_valid = true;
-          }
+        if (sel >= 0 && core_cmd_tap_rx(sel)) {
+          // TX-state arming now lives inside core_cmd_tap_rx so both the
+          // Cardputer key path and the BLE tap_rx RPC arm immediately.
           rx_flash_idx = sel;
           rx_flash_deadline = rtc_now_ms() + 500;
           ui_draw_rx(rx_flash_idx);
@@ -5637,16 +5856,13 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           if (start_idx + 5 < qso_count) { tx_page++; redraw_tx_view(); }
         } else if (c >= '2' && c <= '6') {
           int idx = start_idx + (c - '2');
-          if (autoseq_drop_index(idx)) {
+          if (core_cmd_drop_qso(idx)) {  // routes through core_api (fires qso_changed)
             g_pending_tx_valid = false;
             redraw_tx_view();
             // Re-evaluate TX after queue change
             AutoseqTxEntry pending;
             if (autoseq_fetch_pending_tx(pending)) {
-              g_qso_xmit = true;
-              g_target_slot_parity = pending.slot_id & 1;
-              g_pending_tx = pending;
-              g_pending_tx_valid = true;
+              arm_pending_tx(pending);
             }
           }
         } else if (c == '1') {
@@ -5656,10 +5872,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             // Re-evaluate TX after queue change
             AutoseqTxEntry pending;
             if (autoseq_fetch_pending_tx(pending)) {
-              g_qso_xmit = true;
-              g_target_slot_parity = pending.slot_id & 1;
-              g_pending_tx = pending;
-              g_pending_tx_valid = true;
+              arm_pending_tx(pending);
             }
           }
         } else if (c == 'e' || c == 'E') {
@@ -5705,36 +5918,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         if (status_edit_idx == -1) {
           if (c == '1') { g_status_beacon_temp = (BeaconMode)(((int)g_status_beacon_temp + 1) % 3); draw_status_view(); }
           else if (c == '2') {
-            status_edit_idx = 1;
-            draw_status_view();
-            if (canonical_radio_type(g_radio) == RadioType::KH1 && !g_kh1_connected) {
-              g_kh1_connected = true;
-              apply_radio_profile_binding();
-            }
-            if (!audio_source_is_streaming()) {
-              debug_log_line("UAC2 start");
-              apply_radio_profile_binding();
-              debug_log_line("UAC2 bind");
-              if (!audio_source_start()) {
-                debug_log_line("UAC2 afail");
-              } else {
-                debug_log_line("UAC2 aok");
-                g_decode_enabled = true;
-                ui_set_paused(false);
-                ui_clear_waterfall();
-                esp_err_t rc = radio_control_on_audio_start();
-                debug_log_line(rc == ESP_OK ? "UAC2 catok" : "UAC2 catng");
-              }
-            }
-            int freq_hz = g_bands[g_band_sel].freq * 1000;
-            if (radio_control_ready()) {
-              bool ok = (radio_control_sync_frequency_mode(freq_hz) == ESP_OK);
-              debug_log_line(ok ? "CAT sync sent" : "CAT sync failed");
-            } else {
-              debug_log_line("CAT not ready");
-            }
-            status_edit_idx = -1;
-            draw_status_view();
+            begin_usb_host_mode();
           }
           else if (c == '3') {
             advance_active_band(1);
@@ -6089,10 +6273,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   // still fire instead of the FT.
                   AutoseqTxEntry pending;
                   if (autoseq_fetch_pending_tx(pending)) {
-                    g_qso_xmit = true;
-                    g_pending_tx = pending;
-                    g_pending_tx_valid = true;
-                    g_target_slot_parity = pending.slot_id & 1;
+                    arm_pending_tx(pending);
                   }
                   menu_flash_idx = 1; // absolute index of "Send FreeText"
                   menu_flash_deadline = rtc_now_ms() + 500;

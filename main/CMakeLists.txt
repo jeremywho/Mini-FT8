@@ -2,6 +2,8 @@ idf_component_register(
     SRCS "main.cpp"
          "autoseq.cpp"
          "audio_source.cpp"
+         "ble_native.cpp"
+         "core_api.cpp"
          "gps.cpp"
          "radio_control.cpp"
          "radio_control_qmx.cpp"
@@ -9,7 +11,7 @@ idf_component_register(
          "stream_uac.cpp"
          "resample.cpp"
     INCLUDE_DIRS "."
-    REQUIRES ui M5Unified M5GFX M5Cardputer ft8_lib usb_host_uac usb_host_cdc_acm fatfs sdmmc bt nvs_flash efuse
+    REQUIRES ui M5Unified M5GFX M5Cardputer ft8_lib usb_host_uac usb_host_cdc_acm fatfs sdmmc bt nvs_flash efuse json
     PRIV_REQUIRES spiffs
 )
 target_compile_options(${COMPONENT_LIB} PRIVATE -Werror)
