@@ -59,6 +59,10 @@ extern "C" {
 #include "driver/sdspi_host.h"
 #include "sdmmc_cmd.h"
 #include "esp_vfs_fat.h"
+#include "esp_partition.h"
+#include "tinyusb.h"
+#include "tinyusb_default_config.h"
+#include "tinyusb_msc.h"
 
 static const char* STATION_FILE = "/storage/Station.txt";
 static sdmmc_card_t* g_sd_card = NULL;
@@ -1069,6 +1073,12 @@ static UIMode g_ble_qso_return_mode = UIMode::RX;
 static void enter_msc_mode(const char* reason);
 void save_station_data();  // visible to core_api.cpp
 
+// Storage helpers — defined alongside the FATFS mount code further
+// down. enter_msc_mode (which appears earlier in the file) needs to
+// unmount before handing the WL partition off to TinyUSB MSC.
+static bool storage_is_mounted();
+static void unmount_storage();
+
 // Deferred-save flag. core_api.cpp's RPC handlers (running on the
 // shallow ble_native task) flip this to ask the main task to flush
 // station data — the 22-fprintf chain is too deep for that 4 KB
@@ -1109,12 +1119,12 @@ static void ble_try_dump_qso_file_by_key(char key);
 
 
 static std::vector<std::string> g_msc_lines = {
-    "MSC: USB drive",
-    "active.",
+    "Mini-FT8 USB drive",
+    "now mounted on PC.",
     "",
-    "Copy logs from PC,",
-    "then press any key",
-    "to reboot."
+    "Copy ADIF / Cabrillo",
+    "logs, then press any",
+    "key to reboot."
 };
 
 static std::vector<std::string> g_startup_lines = {
@@ -4922,20 +4932,75 @@ static bool    g_qmx_detect_active     = false;
 static int64_t g_qmx_detect_deadline_ms = 0;
 static constexpr int64_t kQmxDetectTimeoutMs = 10000;
 
-// Switch to MSC (USB Mass Storage) mode. This is a one-way transition:
-// to leave MSC, the operator copies their logs off and reboots.
-//
-// Stages 1+2: renames CONTROL -> MSC, renders the instruction screen,
-// tears down NimBLE to free ~60 KB heap. No USB drive yet.
-// Stage 3 will tear down USB host, unmount FATFS, and bring up TinyUSB
-// MSC so the host PC sees Mini-FT8 as a USB drive.
+// Switch to MSC (USB Mass Storage) mode. One-way transition: the
+// operator copies logs off via the host PC and reboots Mini-FT8 to
+// resume operating. esp_bt_controller_mem_release(BLE) inside
+// nimble_teardown is irreversible, and we re-claim USB-OTG as a
+// device port (was host) for the duration.
 static void enter_msc_mode(const char* reason) {
   g_qmx_detect_active = false;
   ESP_LOGI(TAG, "Entering MSC mode: %s", reason);
   debug_log_line("Entering MSC mode");
+
+  // Drop the audio path (releases QMX + USB host), then BLE.
   audio_source_stop();
   vTaskDelay(pdMS_TO_TICKS(200));
   nimble_teardown();
+
+  // Drain any pending Station.txt save that the BLE RPC layer queued
+  // before teardown — once we unmount, those writes can't land.
+  if (g_config_save_pending) {
+    g_config_save_pending = false;
+    save_station_data();
+  }
+
+  // Unmount FATFS so the host PC has exclusive access to the WL
+  // partition via MSC. The unmount internally wl_unmounts, so we
+  // re-mount the WL layer fresh below.
+  unmount_storage();
+
+  // Re-bind the partition through wear_levelling for MSC. TinyUSB MSC
+  // does raw block I/O against this handle.
+  const esp_partition_t* part = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, "storage");
+  if (!part) {
+    ESP_LOGE(TAG, "MSC: storage partition not found");
+    enter_mode(UIMode::MSC);
+    return;
+  }
+  wl_handle_t wl = WL_INVALID_HANDLE;
+  if (wl_mount(part, &wl) != ESP_OK || wl == WL_INVALID_HANDLE) {
+    ESP_LOGE(TAG, "MSC: wl_mount failed");
+    enter_mode(UIMode::MSC);
+    return;
+  }
+
+  // Install MSC class driver, register the WL-backed storage as LUN 0,
+  // then bring the USB device up — the host PC enumerates it as a
+  // removable drive.
+  tinyusb_msc_driver_config_t msc_drv_cfg = {};
+  if (tinyusb_msc_install_driver(&msc_drv_cfg) != ESP_OK) {
+    ESP_LOGE(TAG, "MSC: install_driver failed");
+    enter_mode(UIMode::MSC);
+    return;
+  }
+  tinyusb_msc_storage_config_t msc_storage_cfg = {};
+  msc_storage_cfg.medium.wl_handle = wl;
+  tinyusb_msc_storage_handle_t msc_storage_hdl = nullptr;
+  if (tinyusb_msc_new_storage_spiflash(&msc_storage_cfg,
+                                       &msc_storage_hdl) != ESP_OK) {
+    ESP_LOGE(TAG, "MSC: new_storage_spiflash failed");
+    enter_mode(UIMode::MSC);
+    return;
+  }
+  const tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
+  if (tinyusb_driver_install(&tusb_cfg) != ESP_OK) {
+    ESP_LOGE(TAG, "MSC: tinyusb_driver_install failed");
+    enter_mode(UIMode::MSC);
+    return;
+  }
+  ESP_LOGI(TAG, "MSC ready: PC will see Mini-FT8 as a USB drive");
+
   enter_mode(UIMode::MSC);
   ui_force_redraw_rx();
 }
@@ -5034,6 +5099,12 @@ static esp_err_t mount_storage() {
     s_storage_wl_handle = WL_INVALID_HANDLE;
   }
   return err;
+}
+
+static void unmount_storage() {
+  if (!storage_is_mounted()) return;
+  esp_vfs_fat_spiflash_unmount_rw_wl("/storage", s_storage_wl_handle);
+  s_storage_wl_handle = WL_INVALID_HANDLE;
 }
 
 static void app_task_core0(void* /*param*/) {

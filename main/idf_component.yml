@@ -20,3 +20,7 @@ dependencies:
   espressif/usb: '*'
   # USB Host CDC for CAT
   espressif/usb_host_cdc_acm: ^2.2.0
+  # TinyUSB device stack — used for MSC (USB Mass Storage) export when
+  # the operator enters MSC mode (a one-way teardown of BLE + USB host
+  # that exposes the FATFS partition as a USB drive on a host PC).
+  espressif/esp_tinyusb: ^2.1.0
