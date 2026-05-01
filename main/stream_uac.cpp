@@ -441,8 +441,30 @@ static void usb_lib_task(void* arg) {
         ESP_LOGI(TAG, "CDC-ACM driver uninstalled");
     }
 
+    // Drain pending USB host events. usb_host_uninstall() refuses to
+    // run (returns ESP_ERR_INVALID_STATE without releasing the USB
+    // PHY) if process_pending_flags / lib_event_flags / flags.val is
+    // non-zero. cdc_acm_host_uninstall posts a client-detach event
+    // that must be pumped through, otherwise the PHY stays claimed
+    // and the subsequent TinyUSB device-mode init fails with
+    // "selected PHY is in use" — which is exactly what we hit on the
+    // no-QMX-after-10s path where no device-disconnect ever
+    // pre-drained the queue. Pump until ALL_FREE fires or we time
+    // out (defence against a stuck event we can't service anyway).
+    for (int i = 0; i < 50; ++i) {
+        uint32_t event_flags = 0;
+        usb_host_lib_handle_events(pdMS_TO_TICKS(20), &event_flags);
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
+            usb_host_device_free_all();
+        }
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) break;
+    }
+
     ESP_LOGI(TAG, "USB Host uninstalling");
-    usb_host_uninstall();
+    esp_err_t uerr = usb_host_uninstall();
+    if (uerr != ESP_OK) {
+        ESP_LOGW(TAG, "usb_host_uninstall: %s", esp_err_to_name(uerr));
+    }
     s_usb_task_handle = NULL;
     vTaskDelete(NULL);
 }

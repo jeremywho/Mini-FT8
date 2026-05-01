@@ -1122,9 +1122,9 @@ static std::vector<std::string> g_msc_lines = {
     "Mini-FT8 USB drive",
     "now mounted on PC.",
     "",
-    "Copy ADIF / Cabrillo",
-    "logs, then press any",
-    "key to reboot."
+    "Copy ADIF logs,",
+    "then press any key",
+    "to reboot."
 };
 
 static std::vector<std::string> g_startup_lines = {
