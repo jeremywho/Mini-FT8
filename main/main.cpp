@@ -38,7 +38,6 @@ extern "C" {
 #include <unistd.h>
 #include <errno.h>
 #include <memory>
-#include "driver/usb_serial_jtag.h"
 #include "hal/uart_ll.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
@@ -947,7 +946,7 @@ static bool rewrite_dxpedition_for_mycall(const std::string& raw_text,
 }
 
 static const char* TAG = "FT8";
-enum class UIMode { RX, TX, BAND, MENU, CONTROL, DEBUG, STATUS, QSO, GPS };
+enum class UIMode { RX, TX, BAND, MENU, MSC, DEBUG, STATUS, QSO, GPS };
 static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
 // NOTE: previous `std::vector<UiRxLine> g_rx_lines` was removed to eliminate
@@ -1023,7 +1022,7 @@ static bool g_ble_qso_pick_mode = false;
 static bool g_ble_dump_in_progress = false;
 static UIMode g_ble_qso_return_mode = UIMode::RX;
 
-static void host_handle_line(const std::string& line);
+static void enter_msc_mode(const char* reason);
 void save_station_data();  // visible to core_api.cpp
 
 // Deferred-save flag. core_api.cpp's RPC handlers (running on the
@@ -1042,8 +1041,6 @@ bool g_pending_tx_valid = false;
 // g_offset_src has been declared.
 void arm_pending_tx(const AutoseqTxEntry& pending);
 volatile bool g_tx_cancel_requested = false;   // visible to core_api.cpp
-static void host_process_bytes(const uint8_t* buf, size_t len);
-static void poll_host_uart();
 static bool ble_pop_input(BleUiInput& out);
 static void ble_update_name_from_station(bool restart_adv);
 static void ble_mirror_tick();
@@ -1067,17 +1064,13 @@ static void ble_try_dump_qso_file_by_key(char key);
 
 
 
-static std::vector<std::string> g_ctrl_lines = {
-    "C MODE: USB serial",
-    "Commands:",
-    "WRITEBIN <file> <size> <crc32_hex>",
-    "WRITE/APPEND",
-    "READ/DELETE",
-    "DATE [YYYY-MM-DD]",
-    "TIME [HH:MM:SS]",
-    "SLEEP - deep sleep",
-    "LIST/INFO/HELP",
-    "EXIT to leave"
+static std::vector<std::string> g_msc_lines = {
+    "MSC: USB drive",
+    "active.",
+    "",
+    "Copy logs from PC,",
+    "then press any key",
+    "to reboot."
 };
 
 static std::vector<std::string> g_startup_lines = {
@@ -1137,23 +1130,7 @@ static std::string g_q_current_file;
 static std::vector<std::string> g_d_lines;
 static std::vector<std::string> g_d_files;
 static int d_page = 0;
-static std::string host_input;
-static const char* HOST_PROMPT = "MINIFT8> ";
-static bool usb_ready = false;
 static QueueHandle_t s_key_inject_queue = nullptr;
-static bool host_bin_active = false;
-static size_t host_bin_remaining = 0;
-static FILE* host_bin_fp = nullptr;
-static uint32_t host_bin_crc = 0;
-static uint32_t host_bin_expected_crc = 0;
-static size_t host_bin_received = 0;
-static std::vector<uint8_t> host_bin_buf;
-static const size_t HOST_BIN_CHUNK = 512;
-static size_t host_bin_chunk_expect = 0; // payload bytes this chunk (excludes CRC trailer)
-static uint8_t host_bin_first8[8] = {0};
-static uint8_t host_bin_last8[8] = {0};
-static size_t host_bin_first_filled = 0;
-static std::string host_bin_path;
 
 // Software RTC
 static time_t rtc_epoch_base = 0;
@@ -1766,17 +1743,6 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
 }
 
 
-static void ensure_usb() {
-  if (usb_ready) return;
-  usb_serial_jtag_driver_config_t cfg = {
-    .tx_buffer_size = 1024,
-    .rx_buffer_size = 4096,
-  };
-  if (usb_serial_jtag_driver_install(&cfg) == ESP_OK) {
-    usb_ready = true;
-  }
-}
-
 static bool uart_inject_last_was_cr = false;
 
 static void poll_uart_inject_keys() {
@@ -1810,22 +1776,6 @@ static void poll_uart_inject_keys() {
   }
 }
 
-static void host_write_str(const std::string& s) {
-  ensure_usb();
-  if (usb_ready) {
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(s.data());
-    size_t remaining = s.size();
-    while (remaining > 0) {
-      size_t chunk = remaining;
-      if (chunk > 256) chunk = 256;
-      int written = usb_serial_jtag_write_bytes(p, chunk, portMAX_DELAY);
-      if (written <= 0) break;
-      p += written;
-      remaining -= written;
-    }
-  }
-}
-
 // ================================================================
 // UART screen mirror
 //
@@ -1847,7 +1797,7 @@ static const char* uart_mirror_mode_label(UIMode mode) {
     case UIMode::TX:      return "TX";
     case UIMode::BAND:    return "BAND";
     case UIMode::MENU:    return "MENU";
-    case UIMode::CONTROL: return "CONTROL";
+    case UIMode::MSC: return "MSC";
     case UIMode::DEBUG:   return "DEBUG";
     case UIMode::STATUS:  return "STATUS";
     case UIMode::QSO:     return "QSO";
@@ -4007,7 +3957,7 @@ static const char* ble_page_label(UIMode mode) {
     case UIMode::TX: return "TX";
     case UIMode::BAND: return "BAND";
     case UIMode::MENU: return "MENU";
-    case UIMode::CONTROL: return "CONTROL";
+    case UIMode::MSC: return "MSC";
     case UIMode::DEBUG: return "DELETE";
     case UIMode::STATUS: return "STATUS";
     case UIMode::QSO: return "QSO";
@@ -4532,348 +4482,6 @@ static std::string trim_upper_copy(const std::string& s) {
   return out;
 }
 
-static uint32_t parse_crc_hex(const std::string& hex) {
-  if (hex.empty()) return 0;
-  char* end = nullptr;
-  unsigned long v = strtoul(hex.c_str(), &end, 16);
-  if (end == hex.c_str() || *end != '\0') return 0;
-  return (uint32_t)v;
-}
-
-static uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len) {
-  crc = crc ^ 0xFFFFFFFFu;
-  for (size_t i = 0; i < len; ++i) {
-    crc ^= data[i];
-    for (int j = 0; j < 8; ++j) {
-      uint32_t mask = -(crc & 1u);
-      crc = (crc >> 1) ^ (0xEDB88320u & mask);
-    }
-  }
-  return crc ^ 0xFFFFFFFFu;
-}
-
-static void host_debug_hex8(const char* prefix, const uint8_t* b) {
-  char buf[64];
-  int n = snprintf(buf, sizeof(buf), "%s ", prefix);
-  for (int i = 0; i < 8 && n + 3 < (int)sizeof(buf); ++i) {
-    n += snprintf(buf + n, sizeof(buf) - n, "%02X ", b[i]);
-  }
-  if (n > 0 && buf[n - 1] == ' ') buf[n - 1] = 0;
-  host_write_str(std::string(buf) + "\r\n");
-}
-
-static void host_handle_line(const std::string& line_in) {
-  bool send_prompt = true;
-  std::string line = trim_copy(line_in);
-  if (line.empty()) { /* host_write_str(HOST_PROMPT);*/ return; }
-  debug_log_line(std::string("[HOST RX] ") + line);
-  //std::string echo = std::string("ECHO: ") + line + "\r\n";
-  //host_write_str(echo);
-
-  auto to_upper = [](std::string s) {
-    for (auto& c : s) c = toupper((unsigned char)c);
-    return s;
-  };
-  std::istringstream iss(line);
-  std::string cmd;
-  iss >> cmd;
-  std::string cmd_up = to_upper(cmd);
-  std::string rest;
-  std::getline(iss, rest);
-  rest = trim_copy(rest);
-
-  auto send = [](const std::string& msg) { host_write_str(msg + "\r\n"); };
-
-  if (cmd_up == "WRITE" || cmd_up == "APPEND") {
-    std::istringstream rs(rest);
-    std::string fname;
-    rs >> fname;
-    std::string content;
-    std::getline(rs, content);
-    content = trim_copy(content);
-    if (fname.empty()) {
-      send("ERROR: filename required");
-    } else {
-      std::string path = std::string("/storage/") + fname;
-      const char* mode = (cmd_up == "WRITE") ? "w" : "a";
-      FILE* f = fopen(path.c_str(), mode);
-      if (!f) send("ERROR: open failed");
-      else { fwrite(content.data(), 1, content.size(), f); fclose(f); send("OK"); }
-    }
-  } else if (cmd_up == "READ") {
-    if (rest.empty()) send("ERROR: filename required");
-    else {
-      std::string path = std::string("/storage/") + rest;
-      FILE* f = fopen(path.c_str(), "r");
-      if (!f) send("ERROR: open failed");
-      else {
-        char buf[128];
-        while (fgets(buf, sizeof(buf), f)) host_write_str(std::string(buf));
-        fclose(f);
-        //send("OK");
-        send_prompt = false;
-      }
-    }
-  } else if (cmd_up == "DELETE") {
-    if (rest.empty()) send("ERROR: filename required");
-    else {
-      std::string path = std::string("/storage/") + rest;
-      if (unlink(path.c_str()) == 0) send("OK"); else send("ERROR: delete failed");
-    }
-  } else if (cmd_up == "LIST") {
-    DIR* d = opendir("/storage");
-    if (!d) send("ERROR: opendir failed");
-    else {
-      struct dirent* ent;
-      while ((ent = readdir(d)) != nullptr) {
-        send(ent->d_name);
-      }
-      closedir(d);
-      send("OK");
-    }
-  } else if (cmd_up == "WRITEBIN") {
-    std::istringstream rs(rest);
-    std::string fname;
-    size_t size = 0;
-    std::string crc_hex;
-    rs >> fname >> size >> crc_hex;
-    uint32_t crc_exp = parse_crc_hex(crc_hex);
-    if (fname.empty() || size == 0 || crc_hex.empty()) {
-      send("ERROR: filename, size, crc32_hex required");
-    } else if (host_bin_active) {
-      send("ERROR: binary upload in progress");
-    } else {
-      std::string path = std::string("/storage/") + fname;
-      FILE* f = fopen(path.c_str(), "wb");
-      if (!f) {
-        send("ERROR: open failed");
-      } else {
-        host_bin_path = path;
-        host_bin_active = true;
-        host_bin_remaining = size;
-        host_bin_fp = f;
-        host_bin_crc = 0;
-        host_bin_expected_crc = crc_exp;
-        host_bin_received = 0;
-        host_bin_buf.clear();
-        host_bin_buf.reserve(HOST_BIN_CHUNK);
-        host_bin_chunk_expect = (host_bin_remaining < HOST_BIN_CHUNK) ? host_bin_remaining : HOST_BIN_CHUNK;
-        host_bin_first_filled = 0;
-        memset(host_bin_first8, 0, sizeof(host_bin_first8));
-        memset(host_bin_last8, 0, sizeof(host_bin_last8));
-        host_write_str("OK: send " + std::to_string(size) + " bytes, chunk " + std::to_string(HOST_BIN_CHUNK) + " +4crc\r\n");
-        send_prompt = false; // prompt after binary upload completes
-      }
-    }
-  } else if (cmd_up == "DATE") {
-    if (rest.empty()) {
-      send("DATE " + g_date);
-    } else {
-      int y, M, d;
-      if (sscanf(rest.c_str(), "%d-%d-%d", &y, &M, &d) != 3 ||
-          y < 2024 || y > 2099 || M < 1 || M > 12 || d < 1 || d > 31) {
-        send("ERROR: use DATE YYYY-MM-DD");
-      } else {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%04d-%02d-%02d", y, M, d);
-        g_date = buf;
-        if (rtc_set_from_strings()) { g_time_synced_from_gps = false; rtc_sync_to_hw(); save_station_data(); send("OK"); }
-        else send("ERROR: invalid date");
-      }
-    }
-  } else if (cmd_up == "TIME") {
-    if (rest.empty()) {
-      send("TIME " + g_time);
-    } else {
-      int h, m, s;
-      if (sscanf(rest.c_str(), "%d:%d:%d", &h, &m, &s) != 3 ||
-          h < 0 || h > 23 || m < 0 || m > 59 || s < 0 || s > 59) {
-        send("ERROR: use TIME HH:MM:SS");
-      } else {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
-        g_time = buf;
-        if (rtc_set_from_strings()) { g_time_synced_from_gps = false; rtc_sync_to_hw(); save_station_data(); send("OK"); }
-        else send("ERROR: invalid time");
-      }
-    }
-  } else if (cmd_up == "SLEEP") {
-    if (rtc_valid) {
-      // Compute current time in milliseconds, round up to next second boundary
-      int64_t elapsed_ms = esp_timer_get_time() / 1000 - rtc_ms_start;
-      int64_t now_ms = (time_t)rtc_epoch_base * 1000LL + elapsed_ms;
-      int64_t frac = now_ms % 1000;
-      int64_t wait_ms = (frac > 0) ? (1000 - frac) : 0;
-      time_t sleep_epoch = (time_t)((now_ms + 999) / 1000);  // ceil to next second
-
-      g_rtc_sleep_epoch = sleep_epoch;
-      save_station_data();
-
-      // Wait until the second boundary, then set HW RTC and sleep
-      if (wait_ms > 0) vTaskDelay(pdMS_TO_TICKS(wait_ms));
-      struct timeval tv = { .tv_sec = sleep_epoch, .tv_usec = 0 };
-      settimeofday(&tv, NULL);
-    }
-    send("OK: entering deep sleep");
-    M5.Display.sleep();
-    vTaskDelay(pdMS_TO_TICKS(10));
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
-    esp_deep_sleep_start();
-  } else if (cmd_up == "INFO") {
-    send("Heap: " + std::to_string(heap_caps_get_free_size(MALLOC_CAP_DEFAULT)));
-    send("OK");
-  } else if (cmd_up == "HELP") {
-    for (auto& l : g_ctrl_lines) send(l);
-  } else if (cmd_up == "EXIT") {
-    send("OK: exit host");
-    enter_mode(UIMode::RX);
-    return;
-  } else {
-    send("ERROR: Unknown command. Type HELP.");
-  }
-
-  if (send_prompt) host_write_str(std::string(HOST_PROMPT));
-}
-
-static void host_process_bytes(const uint8_t* buf, size_t len) {
-  ESP_LOGD(TAG, "host_process_bytes len=%u", (unsigned)len);
-  for (size_t i = 0; i < len; ) {
-    if (host_bin_active) {
-      // Skip any stray CR/LF before first payload byte
-      if (host_bin_received == 0 && host_bin_buf.empty() && (buf[i] == '\r' || buf[i] == '\n')) {
-        ++i;
-        continue;
-      }
-      size_t payload_need = host_bin_chunk_expect;
-      size_t total_need = payload_need + 4; // payload + crc32 trailer
-      size_t avail = len - i;
-      size_t copy = total_need - host_bin_buf.size();
-      if (copy > avail) copy = avail;
-      host_bin_buf.insert(host_bin_buf.end(), buf + i, buf + i + copy);
-      i += copy;
-
-      if (host_bin_buf.size() >= total_need) {
-        size_t payload_len = payload_need;
-        uint32_t recv_crc = (uint32_t(host_bin_buf[payload_len])) |
-                            (uint32_t(host_bin_buf[payload_len + 1]) << 8) |
-                            (uint32_t(host_bin_buf[payload_len + 2]) << 16) |
-                            (uint32_t(host_bin_buf[payload_len + 3]) << 24);
-        uint32_t calc_crc = crc32_update(0, host_bin_buf.data(), payload_len);
-        if (calc_crc != recv_crc) {
-          char dbg[128];
-          snprintf(dbg, sizeof(dbg), "ERROR: chunk crc off=%u len=%u calc=%08X recv=%08X\r\n",
-                   (unsigned)(host_bin_received + payload_len), (unsigned)payload_len,
-                   (unsigned)calc_crc, (unsigned)recv_crc);
-          host_write_str(std::string(dbg));
-          // Send first/last bytes of the chunk to compare
-          if (payload_len >= 8) host_debug_hex8("DBG CHUNK FIRST8", host_bin_buf.data());
-          if (payload_len >= 8) host_debug_hex8("DBG CHUNK LAST8", host_bin_buf.data() + payload_len - 8);
-          if (payload_len < 8) host_debug_hex8("DBG CHUNK PART", host_bin_buf.data());
-          // Also report the CRC trailer bytes as seen
-          uint8_t crc_bytes[4] = {
-            host_bin_buf[payload_len],
-            host_bin_buf[payload_len + 1],
-            host_bin_buf[payload_len + 2],
-            host_bin_buf[payload_len + 3]
-          };
-          host_debug_hex8("DBG CRC BYTES", crc_bytes);
-          fclose(host_bin_fp);
-          host_bin_fp = nullptr;
-          host_bin_active = false;
-          host_bin_remaining = 0;
-          host_bin_buf.clear();
-          host_write_str(std::string(HOST_PROMPT));
-          continue;
-        }
-
-        // Capture first/last bytes for debugging
-        if (host_bin_first_filled < 8) {
-          size_t need = 8 - host_bin_first_filled;
-          if (need > payload_len) need = payload_len;
-          memcpy(host_bin_first8 + host_bin_first_filled, host_bin_buf.data(), need);
-          host_bin_first_filled += need;
-        }
-        // update last8 buffer
-        if (payload_len >= 8) {
-          memcpy(host_bin_last8, host_bin_buf.data() + payload_len - 8, 8);
-        } else {
-          // shift existing and append
-          size_t shift = (payload_len + 8 > 8) ? (payload_len) : payload_len;
-          if (shift > 0) {
-            memmove(host_bin_last8, host_bin_last8 + shift, 8 - shift);
-            memcpy(host_bin_last8 + (8 - payload_len), host_bin_buf.data(), payload_len);
-          }
-        }
-
-        size_t written = fwrite(host_bin_buf.data(), 1, payload_len, host_bin_fp);
-        if (written != payload_len) {
-          host_write_str("ERROR: write failed\r\n");
-          fclose(host_bin_fp);
-          host_bin_fp = nullptr;
-          host_bin_active = false;
-          host_bin_remaining = 0;
-          host_bin_buf.clear();
-          host_write_str(std::string(HOST_PROMPT));
-          continue;
-        }
-        host_bin_crc = crc32_update(host_bin_crc, host_bin_buf.data(), payload_len);
-        host_bin_remaining -= payload_len;
-        host_bin_received += payload_len;
-        host_bin_buf.clear();
-        host_write_str("ACK " + std::to_string(host_bin_received) + "\r\n");
-
-        if (host_bin_remaining == 0) {
-          fclose(host_bin_fp);
-          host_bin_fp = nullptr;
-          host_bin_active = false;
-          uint32_t crc_final = host_bin_crc;
-          // Reopen file to send first/last 8 bytes for debugging
-          host_debug_hex8("DBG FIRST8", host_bin_first8);
-          host_debug_hex8("DBG LAST8", host_bin_last8);
-          char crc_line[64];
-          snprintf(crc_line, sizeof(crc_line), "DBG CRC %08X EXPECT %08X\r\n",
-                   (unsigned)crc_final, (unsigned)host_bin_expected_crc);
-          host_write_str(std::string(crc_line));
-          if (crc_final != host_bin_expected_crc) {
-            host_write_str("ERROR: crc mismatch\r\n");
-          } else {
-            host_write_str("OK crc " + std::to_string(crc_final) + "\r\n");
-          }
-          host_write_str(std::string(HOST_PROMPT));
-        } else {
-          host_bin_chunk_expect = (host_bin_remaining < HOST_BIN_CHUNK) ? host_bin_remaining : HOST_BIN_CHUNK;
-        }
-      }
-      continue;
-    }
-    char ch = (char)buf[i++];
-    if (ch == '\r' || ch == '\n') {
-      if (!host_input.empty()) {
-    //ESP_LOGI(TAG, "HOST line: %s", host_input.c_str());
-        host_handle_line(host_input);
-        host_input.clear();
-      } else {
-        //host_write_str(std::string(HOST_PROMPT));
-      }
-    } else if (ch == 0x08 || ch == 0x7f) {
-      if (!host_input.empty()) host_input.pop_back();
-    } else if (ch >= 32 && ch < 127) {
-      host_input.push_back(ch);
-    }
-  }
-}
-
-static void poll_host_uart() {
-  ensure_usb();
-  if (!usb_ready) return;
-  uint8_t buf[512];
-  while (true) {
-    int r = usb_serial_jtag_read_bytes(buf, sizeof(buf), 0);
-    if (r <= 0) break;
-    host_process_bytes(buf, (size_t)r);
-  }
-}
-
 static void load_station_data() {
   // Sync only Station.txt from SD to SPIFFS (no legacy fallback).
   sync_station_txt_from_sd_to_spiffs();
@@ -5074,16 +4682,8 @@ static void enter_mode(UIMode new_mode) {
       delete_load_file_list();
       ui_draw_list(g_d_lines, d_page, -1);
       break;
-    case UIMode::CONTROL:
-      ui_draw_debug(g_ctrl_lines, 0);
-      host_input.clear();
-      ensure_usb();
-      if (usb_ready) {
-        host_write_str("READY\r\n");
-        host_write_str(std::string(HOST_PROMPT));
-      } else {
-        debug_log_line("USB serial not ready");
-      }
+    case UIMode::MSC:
+      ui_draw_debug(g_msc_lines, 0);
       break;
     case UIMode::QSO:
       g_q_show_entries = false;
@@ -5278,19 +4878,21 @@ static bool    g_qmx_detect_active     = false;
 static int64_t g_qmx_detect_deadline_ms = 0;
 static constexpr int64_t kQmxDetectTimeoutMs = 10000;
 
-// Tear down the USB host stack and switch to CONTROL mode. usb_host_uninstall
-// (driven by audio_source_stop's synchronous teardown chain) releases the
-// USB-OTG bus, at which point the always-installed USB Serial JTAG driver
-// resumes ownership and the PC re-enumerates Mini-FT8 as a serial device.
-static void fall_back_to_control_mode(const char* reason) {
+// Switch to MSC (USB Mass Storage) mode. This is a one-way transition:
+// to leave MSC, the operator copies their logs off and reboots.
+//
+// Stage 1 (this commit): renames CONTROL -> MSC, renders the MSC
+// instruction screen, but no actual USB device is exposed yet.
+// Stage 2 will add NimBLE teardown to free ~60 KB of heap.
+// Stage 3 will tear down USB host, unmount FATFS, and bring up
+// TinyUSB MSC so the host PC sees Mini-FT8 as a USB drive.
+static void enter_msc_mode(const char* reason) {
   g_qmx_detect_active = false;
-  ESP_LOGI(TAG, "USB host fallback: %s — entering CONTROL", reason);
-  debug_log_line("No QMX -> CONTROL");
+  ESP_LOGI(TAG, "Entering MSC mode: %s", reason);
+  debug_log_line("Entering MSC mode");
   audio_source_stop();
-  // Small settle window so USB Serial JTAG fully reclaims the bus before
-  // host_handle_line starts pumping bytes through it.
   vTaskDelay(pdMS_TO_TICKS(200));
-  enter_mode(UIMode::CONTROL);
+  enter_mode(UIMode::MSC);
   ui_force_redraw_rx();
 }
 
@@ -5644,70 +5246,22 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         g_qmx_detect_active = false;
         ESP_LOGI(TAG, "QMX detected; staying in USB host mode");
       } else if (esp_timer_get_time() / 1000 >= g_qmx_detect_deadline_ms) {
-        fall_back_to_control_mode("no QMX after 10s");
+        enter_msc_mode("no QMX after 10s");
       }
     }
 
-  // CONTROL mode: legacy host serial protocol over USB only
-  if (ui_mode == UIMode::CONTROL) {
-    poll_host_uart();
-    if (host_bin_active) { // block keyboard exits during binary upload
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
-    }
-    if (c == 0) {
-      last_key = 0;
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
-    }
-    if (c == last_key) {
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
+  // MSC mode is one-way — esp_bt_controller_mem_release (added in
+  // Stage 2) and TinyUSB device init (Stage 3) cannot be undone without
+  // a reset. Any keypress while in MSC reboots so the operator returns
+  // to normal operation cleanly.
+  if (ui_mode == UIMode::MSC) {
+    if (c != 0 && c != last_key && !c_from_ble) {
+      ESP_LOGI(TAG, "Keypress in MSC mode -> reboot");
+      vTaskDelay(pdMS_TO_TICKS(100));  // let log flush
+      esp_restart();
     }
     last_key = c;
-    if (!c_from_ble) {
-      char mode_key = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-      switch (mode_key) {
-        case 'R':
-          enter_mode(UIMode::RX);
-          break;
-        case 'T':
-          enter_mode(UIMode::TX);
-          break;
-        case 'B':
-          enter_mode(UIMode::BAND);
-          break;
-        case 'Q':
-          enter_mode(UIMode::QSO);
-          break;
-        case 'D':
-          enter_mode(UIMode::DEBUG);
-          break;
-        case 'S':
-          enter_mode(UIMode::STATUS);
-          break;
-        case 'M':
-          enter_mode(UIMode::MENU);
-          break;
-        case 'N':
-          enter_mode(UIMode::MENU);
-          if (menu_page < 2) menu_page++;
-          draw_menu_view();
-          break;
-        case 'O':
-          enter_mode(UIMode::MENU);
-          if (menu_page < 2) menu_page++;
-          if (menu_page < 2) menu_page++;
-          draw_menu_view();
-          break;
-        case 'C':
-          enter_mode(UIMode::RX);
-          break;
-        default:
-          break;
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(20));
     continue;
   }
 
@@ -5886,8 +5440,12 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         } else
 #endif
         {
-          cancel_status_edit();
-          enter_mode(ui_mode == UIMode::CONTROL ? UIMode::RX : UIMode::CONTROL);
+          // 'C' is a one-way trigger into MSC mode (ignored if already
+          // there — MSC's main-loop branch handles its own keypresses).
+          if (ui_mode != UIMode::MSC) {
+            cancel_status_edit();
+            enter_msc_mode("user pressed C");
+          }
           switched = true;
         }
       }
@@ -6161,7 +5719,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           }
           break;
         }
-        case UIMode::CONTROL:
+        case UIMode::MSC:
           break;
         case UIMode::MENU: {
           if (ui_mode == UIMode::MENU) {
