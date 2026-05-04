@@ -1466,6 +1466,44 @@ static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& t
   xSemaphoreGive(log_mutex);
 }
 
+static bool log_gps_grid_line(const std::string& grid8) {
+  if (!g_rxtx_log) return false;
+  if (!log_mutex) return false;
+  if (grid8.size() != 8) return false;
+
+  // GPS grid breadcrumbs use RT files but not log_rxtx_line(), which appends
+  // RX SNR/offset fields that do not apply to this record type.
+  time_t now = (time_t)(rtc_now_ms() / 1000);
+  struct tm t;
+  localtime_r(&now, &t);
+  char ts[32];
+  snprintf(ts, sizeof(ts), "%04d%02d%02d %02d%02d%02d",
+           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+           t.tm_hour, t.tm_min, t.tm_sec);
+  double freq_mhz = 0.001 * (double)g_bands[g_band_sel].freq;
+
+  char log_path[64];
+  build_rxtx_log_path(log_path, sizeof(log_path));
+
+  if (xSemaphoreTake(log_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    ESP_LOGW(TAG, "GPS grid log mutex timeout");
+    return false;
+  }
+
+  FILE* f = fopen(log_path, "a");
+  if (!f) {
+    ESP_LOGW(TAG, "GPS grid log open failed: %s", log_path);
+    xSemaphoreGive(log_mutex);
+    return false;
+  }
+
+  fprintf(f, "G [%s][%.3f] %s\n", ts, freq_mhz, grid8.c_str());
+  fclose(f);
+  xSemaphoreGive(log_mutex);
+  ESP_LOGI(TAG, "GPS grid logged: %s", grid8.c_str());
+  return true;
+}
+
 static bool is_daily_qso_txt_file(const char* name) {
   if (!name) return false;
   if (strlen(name) != 12) return false;  // YYYYMMDD.txt
@@ -2161,6 +2199,59 @@ static bool start_rx_audio_for_current_radio(const char* reason, bool notify_cat
   return true;
 }
 
+static bool handle_kh1_diag_key(char c) {
+  char key = (char)std::tolower((unsigned char)c);
+  if (key != 'u' && key != 'i' && key != 'j' && key != 'k' && key != 'l') {
+    return false;
+  }
+
+  if (!is_kh1_radio(g_radio) || !radio_control_kh1_is_enabled() || !radio_control_ready()) {
+    ESP_LOGW(TAG, "KH1 CAT diagnostic %c skipped: not ready", key);
+    debug_log_line("KH1 CAT not ready");
+    return true;
+  }
+
+  int freq_hz = g_bands[g_band_sel].freq * 1000;
+  int rx_fa = (freq_hz + 5) / 10;
+  int tx_fa = rx_fa + ((g_offset_hz + 5) / 10);
+
+  char seq[128];
+  switch (key) {
+    case 'u':
+      snprintf(seq, sizeof(seq), "u FA%07d if changed; wait; repeat;", tx_fa);
+      break;
+    case 'i':
+      snprintf(seq, sizeof(seq), "i HK1; wait; HK0;");
+      break;
+    case 'j':
+      snprintf(seq, sizeof(seq), "j FA%07d if changed; HK1; wait; HK0; FA%07d if changed;", tx_fa, rx_fa);
+      break;
+    case 'k':
+      snprintf(seq, sizeof(seq), "k FA%07d if changed; HK1; FO00; wait; HK0; FA%07d if changed; FO99;", tx_fa, rx_fa);
+      break;
+    case 'l':
+      snprintf(seq, sizeof(seq), "l FA%07d if changed; HK1; 79xFO; HK0; FA%07d if changed; FO99;", tx_fa, rx_fa);
+      break;
+    default:
+      return true;
+  }
+
+  ESP_LOGI(TAG, "KH1 diag %s", seq);
+  debug_log_line(std::string("KH1 diag ") + seq);
+  bool fa_sent = false;
+  esp_err_t err = radio_control_kh1_diag_test(key, freq_hz, g_offset_hz, &fa_sent);
+  if (err == ESP_OK) {
+    if (key == 'u') {
+      debug_log_line(fa_sent ? "KH1 diag FA sent" : "KH1 diag FA skipped");
+    }
+    debug_log_line("KH1 diag OK");
+  } else {
+    ESP_LOGW(TAG, "KH1 diagnostic %c failed: %s", key, esp_err_to_name(err));
+    debug_log_line(std::string("KH1 diag fail ") + esp_err_to_name(err));
+  }
+  return true;
+}
+
 static std::string lat_lon_to_maidenhead8(double lat, double lon) {
   if (lon < -180.0 || lon > 180.0 || lat < -90.0 || lat > 90.0) return "";
   // Clamp exact upper edge so index math stays in range.
@@ -2218,6 +2309,7 @@ static void draw_gps_view(bool force_redraw = false);
 static void gps_runtime_tick() {
   static int64_t s_last_apply_ms = 0;
   static bool s_time_synced_once = false;
+  static bool s_gps_grid_logged = false;
   static int s_last_time_sync_hour_key = -1;
 
   if (is_kh1_radio(g_radio) && g_kh1_connected) return;
@@ -2298,6 +2390,15 @@ static void gps_runtime_tick() {
         g_time = old_time;
       }
     }
+  }
+
+  // One session breadcrumb is enough to preserve the GPS grid even if no QSO
+  // completes; retry later if logging is disabled or the file write fails.
+  if (!s_gps_grid_logged &&
+      g_time_synced_from_gps &&
+      g_grid_from_gps &&
+      g_grid_gps_display8.size() == 8) {
+    s_gps_grid_logged = log_gps_grid_line(g_grid_gps_display8);
   }
 
   if (changed) {
@@ -5856,7 +5957,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         }
         case UIMode::STATUS: {
         if (status_edit_idx == -1) {
-          if (c == '1') { g_status_beacon_temp = (BeaconMode)(((int)g_status_beacon_temp + 1) % 3); draw_status_view(); }
+          if (handle_kh1_diag_key(c)) { draw_status_view(); }
+          else if (c == '1') { g_status_beacon_temp = (BeaconMode)(((int)g_status_beacon_temp + 1) % 3); draw_status_view(); }
           else if (c == '2') {
             status_edit_idx = 1;
             draw_status_view();

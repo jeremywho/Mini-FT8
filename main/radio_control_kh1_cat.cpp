@@ -22,9 +22,12 @@ static bool s_power_seq_done = true;
 static int s_rx_freq10 = 0;
 static int s_tx_freq10 = 0;
 static int s_tx_base_hz = 1500;
+static int s_current_fa10 = -1;
 static bool s_tx_active = false;
 
 static constexpr int k_fo_map[8] = {0, 6, 13, 19, 25, 31, 38, 44};
+static constexpr int k_diag_key_ms = 750;
+static constexpr int k_diag_tone_ms = 160;
 
 static int hz_to_10hz(int hz) {
     return (hz + 5) / 10;
@@ -81,6 +84,26 @@ static esp_err_t kh1_send_cmd(const char* cmd, uint32_t timeout_ms) {
     return uart_wait_tx_done(k_kh1_uart_num, pdMS_TO_TICKS(timeout_ms));
 }
 
+static esp_err_t kh1_set_fa_if_changed(int freq10, const char* reason, bool* out_sent = nullptr) {
+    if (out_sent) *out_sent = false;
+    // Cache only reflects CAT changes made here; STATUS sync or reconnect
+    // re-establishes state after manual KH1 VFO changes.
+    if (s_current_fa10 == freq10) {
+        ESP_LOGI(TAG, "KH1 FA skip %s FA=%07d", reason ? reason : "", freq10);
+        return ESP_OK;
+    }
+
+    char fa[24];
+    snprintf(fa, sizeof(fa), "FA%07d;", freq10);
+    esp_err_t err = kh1_send_cmd(fa, 200);
+    if (err == ESP_OK) {
+        s_current_fa10 = freq10;
+        if (out_sent) *out_sent = true;
+        ESP_LOGI(TAG, "KH1 FA sent %s FA=%07d", reason ? reason : "", freq10);
+    }
+    return err;
+}
+
 static esp_err_t kh1_sync_frequency_mode(int freq_hz) {
     s_rx_freq10 = hz_to_10hz(freq_hz);
 
@@ -90,9 +113,7 @@ static esp_err_t kh1_sync_frequency_mode(int freq_hz) {
     kh1_send_cmd("MP020;", 200);
     kh1_send_cmd("SW4T;", 200);
 
-    char fa[24];
-    snprintf(fa, sizeof(fa), "FA%07d;", s_rx_freq10);
-    err = kh1_send_cmd(fa, 200);
+    err = kh1_set_fa_if_changed(s_rx_freq10, "sync");
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "KH1 sync ok band_freq=%dHz (FA=%07d)", freq_hz, s_rx_freq10);
     }
@@ -104,12 +125,7 @@ static esp_err_t kh1_begin_tx(int freq_hz, int tx_base_hz) {
     s_tx_base_hz = tx_base_hz;
     s_tx_freq10 = s_rx_freq10 + hz_to_10hz(tx_base_hz);
 
-    esp_err_t err = kh1_send_cmd("MD2;", 200);
-    if (err != ESP_OK) return err;
-
-    char fa[24];
-    snprintf(fa, sizeof(fa), "FA%07d;", s_tx_freq10);
-    err = kh1_send_cmd(fa, 200);
+    esp_err_t err = kh1_set_fa_if_changed(s_tx_freq10, "tx");
     if (err != ESP_OK) return err;
 
     err = kh1_send_cmd("HK1;", 200);
@@ -140,38 +156,144 @@ static esp_err_t kh1_end_tx(void) {
     esp_err_t err = kh1_send_cmd("HK0;", 200);
     if (err != ESP_OK) return err;
 
-    char fa[24];
-    snprintf(fa, sizeof(fa), "FA%07d;", s_rx_freq10);
-    err = kh1_send_cmd(fa, 200);
-    if (err != ESP_OK) return err;
-
+    // Leave FA at the last TX VFO. Fixed offset then avoids relay-triggering
+    // FA commands after the first matching setup.
     err = kh1_send_cmd("FO99;", 200);
     if (err == ESP_OK) {
         s_tx_active = false;
-        ESP_LOGI(TAG, "KH1 TX stop restore FA=%07d", s_rx_freq10);
+        ESP_LOGI(TAG, "KH1 TX stop keep FA=%07d", s_current_fa10);
     }
     return err;
 }
 
 static esp_err_t kh1_set_tune(bool enable, int freq_hz, int tone_hz) {
     if (!enable) {
-        return kh1_end_tx();
+        esp_err_t err = kh1_send_cmd("HK0;", 200);
+        if (err == ESP_OK) {
+            s_tx_active = false;
+            ESP_LOGI(TAG, "KH1 tune key up");
+        }
+        return err;
     }
 
     s_rx_freq10 = hz_to_10hz(freq_hz);
     s_tx_freq10 = s_rx_freq10 + hz_to_10hz(tone_hz);
 
-    esp_err_t err = kh1_send_cmd("MD2;", 200);
-    if (err != ESP_OK) return err;
+    // Tune must always send one FA so KH1/ATU can react before key-down.
+    // Unlike FT8 TX, do not cache-skip this command.
     char fa[24];
     snprintf(fa, sizeof(fa), "FA%07d;", s_tx_freq10);
-    err = kh1_send_cmd(fa, 200);
+    esp_err_t err = kh1_send_cmd(fa, 200);
     if (err != ESP_OK) return err;
-    err = kh1_send_cmd("HK1;", 200);
-    if (err != ESP_OK) return err;
-    s_tx_active = true;
+    s_current_fa10 = s_tx_freq10;
 
-    return kh1_send_cmd("FO00;", 200);
+    err = kh1_send_cmd("HK1;", 200);
+    if (err == ESP_OK) {
+        s_tx_active = true;
+        ESP_LOGI(TAG, "KH1 tune key down FA=%07d", s_tx_freq10);
+    }
+    return err;
+}
+
+static esp_err_t kh1_diag_send_fa(int freq10, const char* reason, bool* out_sent = nullptr) {
+    return kh1_set_fa_if_changed(freq10, reason, out_sent);
+}
+
+static esp_err_t kh1_diag_send_fo_index(int tone_idx, uint32_t timeout_ms) {
+    if (tone_idx < 0) tone_idx = 0;
+    if (tone_idx > 7) tone_idx = 7;
+    char cmd[16];
+    snprintf(cmd, sizeof(cmd), "FO%02d;", k_fo_map[tone_idx]);
+    return kh1_send_cmd(cmd, timeout_ms);
+}
+
+esp_err_t radio_control_kh1_diag_test(char test_key, int freq_hz, int offset_hz, bool* out_fa_sent) {
+    if (test_key >= 'A' && test_key <= 'Z') {
+        test_key = (char)(test_key - 'A' + 'a');
+    }
+    if (out_fa_sent) *out_fa_sent = false;
+    if (!kh1_ready()) return ESP_ERR_INVALID_STATE;
+
+    const int rx_freq10 = hz_to_10hz(freq_hz);
+    const int tx_freq10 = rx_freq10 + hz_to_10hz(offset_hz);
+    esp_err_t err = ESP_OK;
+
+    switch (test_key) {
+    case 'u':
+        ESP_LOGI(TAG, "KH1 diag u: FA%07d if changed; wait %dms; repeat;",
+                 tx_freq10, k_diag_key_ms);
+        err = kh1_diag_send_fa(tx_freq10, "diag-u", out_fa_sent);
+        if (err != ESP_OK) return err;
+        vTaskDelay(pdMS_TO_TICKS(k_diag_key_ms));
+        return kh1_diag_send_fa(tx_freq10, "diag-u-repeat");
+
+    case 'i':
+        ESP_LOGI(TAG, "KH1 diag i: HK1; wait %dms; HK0;", k_diag_key_ms);
+        err = kh1_send_cmd("HK1;", 200);
+        if (err != ESP_OK) return err;
+        vTaskDelay(pdMS_TO_TICKS(k_diag_key_ms));
+        return kh1_send_cmd("HK0;", 200);
+
+    case 'j':
+        ESP_LOGI(TAG, "KH1 diag j: FA%07d if changed; HK1; wait %dms; HK0; FA%07d if changed;",
+                 tx_freq10, k_diag_key_ms, rx_freq10);
+        err = kh1_diag_send_fa(tx_freq10, "diag-j-tx");
+        if (err != ESP_OK) return err;
+        err = kh1_send_cmd("HK1;", 200);
+        if (err != ESP_OK) return err;
+        vTaskDelay(pdMS_TO_TICKS(k_diag_key_ms));
+        err = kh1_send_cmd("HK0;", 200);
+        if (err != ESP_OK) return err;
+        return kh1_diag_send_fa(rx_freq10, "diag-j-rx");
+
+    case 'k':
+        ESP_LOGI(TAG, "KH1 diag k: FA%07d if changed; HK1; FO00; wait %dms; HK0; FA%07d if changed; FO99;",
+                 tx_freq10, k_diag_key_ms, rx_freq10);
+        err = kh1_diag_send_fa(tx_freq10, "diag-k-tx");
+        if (err != ESP_OK) return err;
+        err = kh1_send_cmd("HK1;", 200);
+        if (err != ESP_OK) return err;
+        err = kh1_send_cmd("FO00;", 200);
+        if (err != ESP_OK) {
+            kh1_send_cmd("HK0;", 200);
+            kh1_diag_send_fa(rx_freq10, "diag-k-rx");
+            kh1_send_cmd("FO99;", 200);
+            return err;
+        }
+        vTaskDelay(pdMS_TO_TICKS(k_diag_key_ms));
+        err = kh1_send_cmd("HK0;", 200);
+        if (err != ESP_OK) return err;
+        err = kh1_diag_send_fa(rx_freq10, "diag-k-rx");
+        if (err != ESP_OK) return err;
+        return kh1_send_cmd("FO99;", 200);
+
+    case 'l':
+        ESP_LOGI(TAG, "KH1 diag l: FA%07d if changed; HK1; 79 timed FOxx; HK0; FA%07d if changed; FO99;",
+                 tx_freq10, rx_freq10);
+        err = kh1_diag_send_fa(tx_freq10, "diag-l-tx");
+        if (err != ESP_OK) return err;
+        err = kh1_send_cmd("HK1;", 200);
+        if (err != ESP_OK) return err;
+        for (int i = 0; i < 79; ++i) {
+            err = kh1_diag_send_fo_index(i & 7, 10);
+            if (err != ESP_OK) break;
+            vTaskDelay(pdMS_TO_TICKS(k_diag_tone_ms));
+        }
+        if (err != ESP_OK) {
+            kh1_send_cmd("HK0;", 200);
+            kh1_diag_send_fa(rx_freq10, "diag-l-rx");
+            kh1_send_cmd("FO99;", 200);
+            return err;
+        }
+        err = kh1_send_cmd("HK0;", 200);
+        if (err != ESP_OK) return err;
+        err = kh1_diag_send_fa(rx_freq10, "diag-l-rx");
+        if (err != ESP_OK) return err;
+        return kh1_send_cmd("FO99;", 200);
+
+    default:
+        return ESP_ERR_INVALID_ARG;
+    }
 }
 
 static esp_err_t kh1_on_audio_start(void) {
@@ -221,6 +343,7 @@ void radio_control_kh1_set_enabled(bool enabled) {
     s_kh1_enabled = enabled;
     if (!enabled) {
         s_tx_active = false;
+        s_current_fa10 = -1;
         if (s_uart_inited) {
             uart_wait_tx_done(k_kh1_uart_num, pdMS_TO_TICKS(50));
             uart_flush_input(k_kh1_uart_num);
