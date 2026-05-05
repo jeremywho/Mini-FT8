@@ -5111,7 +5111,9 @@ static void app_task_core0(void* /*param*/) {
   // Mount FATFS first, while heap is fresh — WL grabs its 4 KB sector
   // buffer before USB host or NimBLE start fragmenting things. Stays
   // mounted for the rest of the run; saves write straight through.
-  ESP_ERROR_CHECK(mount_storage());
+  // TEST BENCH: skip FATFS mount (no Station.txt persistence needed,
+  // and freeing the ~6 KB heap pressure helps the pump buffer alloc).
+  // ESP_ERROR_CHECK(mount_storage());
 
   // Initialize mutexes for thread-safe operations
   log_mutex = xSemaphoreCreateMutex();
@@ -5154,8 +5156,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   // free bytes look sufficient. Living with NimBLE-first means USB host
   // has to fit alongside its fragments; the s_usb_buffer halving (4608
   // -> 2304) frees enough DMA-capable headroom for CDC pipe alloc.
-  init_bluetooth();
-  apply_ble_enabled_policy(true);
+  // TEST BENCH: skip BLE init — frees ~65 KB heap (NimBLE controller
+  // pool) so the speaker pump buffer (13.8 KB contiguous) can allocate.
+  // init_bluetooth();
+  // apply_ble_enabled_policy(true);
   apply_radio_profile_binding();
   update_autoseq_cq_type();
 

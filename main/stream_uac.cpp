@@ -117,6 +117,58 @@ static TaskHandle_t s_spk_writer_task = NULL;
 static volatile bool s_spk_writer_stop = false;
 static uint32_t s_spk_packets_sent = 0;
 static uint32_t s_spk_write_errors = 0;
+
+// Pre-computed 1.5 kHz sine wave, 24-bit stereo little-endian, full-scale.
+// Mono duplicated to L/R. 32 samples per cycle (48 kHz / 1.5 kHz = 32).
+// Source: ~/esp/uac_host loopback_validator (bit-exact verified against the
+// STM32 loopback). Used both as the speaker pump source and as the
+// verification reference for the mic loopback path.
+#define EXPECTED_TONE_FRAMES 32
+#define EXPECTED_TONE_FRAME_BYTES 6  // 3 bytes * 2 channels
+#define EXPECTED_TONE_BYTES \
+    (EXPECTED_TONE_FRAMES * EXPECTED_TONE_FRAME_BYTES)  // 192
+static const uint8_t k_expected_tone[EXPECTED_TONE_BYTES] = {
+    /*  0:        0 */ 0x00, 0x00, 0x00,  0x00, 0x00, 0x00,
+    /*  1: +1636536 */ 0xB8, 0xF8, 0x18,  0xB8, 0xF8, 0x18,
+    /*  2: +3210181 */ 0xC5, 0xFB, 0x30,  0xC5, 0xFB, 0x30,
+    /*  3: +4660460 */ 0xEC, 0x1C, 0x47,  0xEC, 0x1C, 0x47,
+    /*  4: +5931641 */ 0x79, 0x82, 0x5A,  0x79, 0x82, 0x5A,
+    /*  5: +6974872 */ 0x98, 0x6D, 0x6A,  0x98, 0x6D, 0x6A,
+    /*  6: +7750062 */ 0xAE, 0x41, 0x76,  0xAE, 0x41, 0x76,
+    /*  7: +8227422 */ 0x5E, 0x8A, 0x7D,  0x5E, 0x8A, 0x7D,
+    /*  8: +8388607 */ 0xFF, 0xFF, 0x7F,  0xFF, 0xFF, 0x7F,
+    /*  9: +8227422 */ 0x5E, 0x8A, 0x7D,  0x5E, 0x8A, 0x7D,
+    /* 10: +7750062 */ 0xAE, 0x41, 0x76,  0xAE, 0x41, 0x76,
+    /* 11: +6974872 */ 0x98, 0x6D, 0x6A,  0x98, 0x6D, 0x6A,
+    /* 12: +5931641 */ 0x79, 0x82, 0x5A,  0x79, 0x82, 0x5A,
+    /* 13: +4660460 */ 0xEC, 0x1C, 0x47,  0xEC, 0x1C, 0x47,
+    /* 14: +3210181 */ 0xC5, 0xFB, 0x30,  0xC5, 0xFB, 0x30,
+    /* 15: +1636536 */ 0xB8, 0xF8, 0x18,  0xB8, 0xF8, 0x18,
+    /* 16:        0 */ 0x00, 0x00, 0x00,  0x00, 0x00, 0x00,
+    /* 17: -1636536 */ 0x48, 0x07, 0xE7,  0x48, 0x07, 0xE7,
+    /* 18: -3210181 */ 0x3B, 0x04, 0xCF,  0x3B, 0x04, 0xCF,
+    /* 19: -4660460 */ 0x14, 0xE3, 0xB8,  0x14, 0xE3, 0xB8,
+    /* 20: -5931641 */ 0x87, 0x7D, 0xA5,  0x87, 0x7D, 0xA5,
+    /* 21: -6974872 */ 0x68, 0x92, 0x95,  0x68, 0x92, 0x95,
+    /* 22: -7750062 */ 0x52, 0xBE, 0x89,  0x52, 0xBE, 0x89,
+    /* 23: -8227422 */ 0xA2, 0x75, 0x82,  0xA2, 0x75, 0x82,
+    /* 24: -8388607 */ 0x01, 0x00, 0x80,  0x01, 0x00, 0x80,
+    /* 25: -8227422 */ 0xA2, 0x75, 0x82,  0xA2, 0x75, 0x82,
+    /* 26: -7750062 */ 0x52, 0xBE, 0x89,  0x52, 0xBE, 0x89,
+    /* 27: -6974872 */ 0x68, 0x92, 0x95,  0x68, 0x92, 0x95,
+    /* 28: -5931641 */ 0x87, 0x7D, 0xA5,  0x87, 0x7D, 0xA5,
+    /* 29: -4660460 */ 0x14, 0xE3, 0xB8,  0x14, 0xE3, 0xB8,
+    /* 30: -3210181 */ 0x3B, 0x04, 0xCF,  0x3B, 0x04, 0xCF,
+    /* 31: -1636536 */ 0x48, 0x07, 0xE7,  0x48, 0x07, 0xE7,
+};
+
+// Mic loopback verification state (matches reference's verify_samples).
+static bool     s_verify_synced = false;
+static uint32_t s_verify_pos = 0;
+static uint32_t s_verify_total_checked = 0;
+static uint32_t s_verify_errors = 0;
+static uint32_t s_verify_samples_since_connect = 0;
+static uint32_t s_verify_grace_samples = 1500;  // skip startup jitter
 static TaskHandle_t s_stream_task_handle = NULL;
 static volatile bool s_stop_requested = false;
 static char s_status_string[64] = "Idle";
@@ -150,6 +202,8 @@ static void stream_uac_task(void* arg);
 static void cdc_close(void);
 static void cdc_try_open(void);
 static void cdc_event_cb(const cdc_acm_host_dev_event_data_t* event, void* user_ctx);
+static void verify_mic_samples(const uint8_t* buf, uint32_t bytes,
+                               uint32_t frame_bytes, uint8_t channels);
 static void cdc_new_dev_cb(usb_device_handle_t usb_dev);
 
 static const char* profile_name(uac_stream_profile_t profile) {
@@ -453,13 +507,13 @@ static void usb_lib_task(void* arg) {
         .xCoreID = 0,
         .new_dev_cb = cdc_new_dev_cb,
     };
-    err = cdc_acm_host_install(&cdc_cfg);
-    if (err == ESP_OK) {
-        s_cdc_installed = true;
-        ESP_LOGI(TAG, "CDC-ACM driver installed");
-    } else {
-        ESP_LOGW(TAG, "CDC-ACM driver install failed: %s", esp_err_to_name(err));
-    }
+    // TEST BENCH: skip CDC entirely. The STM32 loopback device on the OTG
+    // bus has no CDC interface, so cdc_try_open's iface scan would just
+    // spam EP Alloc errors against UAC ifaces. CAT control isn't needed
+    // for the 1.5 kHz tone validator.
+    (void)cdc_cfg;
+    s_cdc_installed = false;
+    ESP_LOGI(TAG, "CDC-ACM install skipped (test bench)");
 
     xTaskNotifyGive((TaskHandle_t)arg);
 
@@ -659,6 +713,15 @@ static void uac_lib_task(void* arg) {
                     s_spk_known = true;
                     ESP_LOGI(TAG, "Speaker captured: addr=%u iface=%u",
                              (unsigned)s_spk_addr, (unsigned)s_spk_iface);
+                    // TEST BENCH: kick off the 1.5 kHz pump immediately —
+                    // no waiting for FT8 TX scheduling. Lets us run the
+                    // OUT-side validator against the STM32 loopback
+                    // without depending on QMX/CAT/beacon scheduling.
+                    if (uac_tx_test_start()) {
+                        ESP_LOGI(TAG, "TEST BENCH: speaker pump auto-started");
+                    } else {
+                        ESP_LOGE(TAG, "TEST BENCH: speaker pump auto-start failed");
+                    }
                 }
             }
         }
@@ -721,17 +784,10 @@ static void stream_uac_task(void* arg) {
         return;
     }
 
-    // Wait until the next 15s boundary so the sample-pump loop below aligns
-    // to FT8 slot edges. Buffers were grabbed above so heap state during
-    // this sleep doesn't matter.
-    {
-        int64_t now_ms = rtc_now_ms();
-        int64_t rem = now_ms % 15000;
-        int64_t wait_ms = (rem < 100) ? 0 : (15000 - rem);
-        if (wait_ms > 0) {
-            vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
-        }
-    }
+    // TEST BENCH: skip the 15s slot-boundary wait. We just want sample
+    // flow to start as soon as possible so the verifier can compare
+    // against k_expected_tone. FT8 slot alignment is irrelevant here.
+    // (Original wait code preserved in git history.)
 
     const int target_blocks = 80;
     int ft8_buffer_idx = 0;  // Current position in ft8_buffer
@@ -755,6 +811,14 @@ static void stream_uac_task(void* arg) {
             }
             continue;
         }
+
+        // TEST BENCH: byte-level verification against k_expected_tone.
+        // The STM32 loopback echoes our OUT samples back via IN, so a
+        // mismatch here means our OUT path is putting wrong bytes on
+        // the wire (and tells us exactly which bytes differ).
+        verify_mic_samples(usb_buffer, bytes_read,
+                           s_format.bit_resolution / 8 * s_format.channels,
+                           s_format.channels);
 
         int frame_bytes = (s_format.bit_resolution / 8) * s_format.channels;
         if (frame_bytes <= 0) {
@@ -1048,9 +1112,11 @@ static void spk_event_cb(uac_host_device_handle_t /*dev*/,
 
 static void spk_writer_task(void* /*arg*/) {
     // Pre-build the entire pump buffer once. SPK_PUMP_BYTES (13824) is an
-    // exact multiple of the 32-frame stereo LUT stride (32 frames * 6 B = 192 B,
-    // and 13824 / 192 = 72), so successive writes wrap seamlessly with no
-    // phase glitch at the buffer boundary.
+    // exact multiple of EXPECTED_TONE_BYTES (192) — 13824 / 192 = 72 —
+    // so successive writes wrap seamlessly on a clean LUT-cycle boundary.
+    // Source the bytes straight from k_expected_tone (already stereo,
+    // bit-exact with the validated reference) — no runtime mono->stereo
+    // expansion, which removes that as a possible bug source.
     uint8_t* pump = (uint8_t*)heap_caps_malloc(SPK_PUMP_BYTES, MALLOC_CAP_DEFAULT);
     if (!pump) {
         ESP_LOGE(TAG, "spk pump alloc failed");
@@ -1058,18 +1124,8 @@ static void spk_writer_task(void* /*arg*/) {
         vTaskDelete(NULL);
         return;
     }
-    const uint32_t total_frames = SPK_PUMP_BYTES / SPK_FRAME_BYTES;  // 2304
-    for (uint32_t frame = 0; frame < total_frames; ++frame) {
-        const uint8_t* mono = &k_test_tone_lut_24bit[(frame % TEST_TONE_LUT_SAMPLES) * 3];
-        uint32_t off = frame * SPK_FRAME_BYTES;
-        // L channel
-        pump[off + 0] = mono[0];
-        pump[off + 1] = mono[1];
-        pump[off + 2] = mono[2];
-        // R channel (mono duplicated)
-        pump[off + 3] = mono[0];
-        pump[off + 4] = mono[1];
-        pump[off + 5] = mono[2];
+    for (uint32_t i = 0; i < SPK_PUMP_BYTES; ++i) {
+        pump[i] = k_expected_tone[i % EXPECTED_TONE_BYTES];
     }
 
     while (!s_spk_writer_stop) {
@@ -1164,6 +1220,123 @@ void uac_tx_test_stop(void) {
 
     ESP_LOGI(TAG, "uac_tx_test: stopped, packets=%u errors=%u",
              (unsigned)s_spk_packets_sent, (unsigned)s_spk_write_errors);
+}
+
+// ===== Mic loopback verification =====
+//
+// The STM32 loopback device echoes whatever we send via UAC OUT back to
+// us via UAC IN, so a byte-for-byte comparison of mic samples against
+// k_expected_tone tells us directly whether our OUT path is putting
+// the right bytes on the wire.
+//
+// This mirrors the logic in ~/esp/uac_host/main/main.c verify_samples():
+// once we've seen SYNC_SAMPLES_REQUIRED consecutive samples that match a
+// known phase, we lock and start counting per-frame mismatches. Skip the
+// first STARTUP_GRACE_SAMPLES to avoid USB streaming startup jitter.
+
+#define VERIFY_SYNC_SAMPLES_REQUIRED 3
+
+static int verify_find_sync_pos(const uint8_t* run, uint32_t run_count) {
+    if (run_count < VERIFY_SYNC_SAMPLES_REQUIRED) return -1;
+    for (uint32_t start = 0; start < EXPECTED_TONE_FRAMES; ++start) {
+        bool match = true;
+        for (uint32_t i = 0; i < run_count; ++i) {
+            uint32_t pos = (start + i) % EXPECTED_TONE_FRAMES;
+            if (memcmp(&run[i * EXPECTED_TONE_FRAME_BYTES],
+                       &k_expected_tone[pos * EXPECTED_TONE_FRAME_BYTES],
+                       EXPECTED_TONE_FRAME_BYTES) != 0) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return (int)start;
+    }
+    return -1;
+}
+
+static void verify_mic_samples(const uint8_t* buf, uint32_t bytes,
+                               uint32_t frame_bytes, uint8_t channels) {
+    // We assume 24-bit stereo when frame_bytes == 6 — that's what the
+    // STM32 loopback advertises. Bail otherwise (FT8 6 kHz path runs
+    // 24-bit stereo too via resampling, but the bytes here are still the
+    // raw 48 kHz samples from the device).
+    if (frame_bytes != EXPECTED_TONE_FRAME_BYTES || channels != 2) return;
+
+    // Multi-sample sync state lives in module-static buffer.
+    static uint8_t sync_run[VERIFY_SYNC_SAMPLES_REQUIRED * EXPECTED_TONE_FRAME_BYTES];
+    static uint32_t sync_run_count = 0;
+
+    uint32_t num_frames = bytes / frame_bytes;
+    for (uint32_t i = 0; i < num_frames; ++i) {
+        const uint8_t* sample = &buf[i * frame_bytes];
+        s_verify_samples_since_connect++;
+
+        // Skip startup grace window — USB ringbuffer fill can have
+        // initial jitter that produces "errors" against a strict LUT.
+        if (s_verify_samples_since_connect < s_verify_grace_samples) continue;
+
+        if (!s_verify_synced) {
+            // Build up a run; try to phase-align against k_expected_tone.
+            memcpy(&sync_run[sync_run_count * EXPECTED_TONE_FRAME_BYTES],
+                   sample, EXPECTED_TONE_FRAME_BYTES);
+            sync_run_count++;
+            if (sync_run_count >= VERIFY_SYNC_SAMPLES_REQUIRED) {
+                int pos = verify_find_sync_pos(sync_run, sync_run_count);
+                if (pos >= 0) {
+                    s_verify_synced = true;
+                    s_verify_pos =
+                        (pos + sync_run_count) % EXPECTED_TONE_FRAMES;
+                    sync_run_count = 0;
+                    ESP_LOGI(TAG, "VERIFY: synced at expected pos=%d "
+                                  "(after %u samples)",
+                             pos, (unsigned)s_verify_samples_since_connect);
+                } else {
+                    // Slide the run by one to keep trying.
+                    memmove(sync_run, &sync_run[EXPECTED_TONE_FRAME_BYTES],
+                            (sync_run_count - 1) * EXPECTED_TONE_FRAME_BYTES);
+                    sync_run_count--;
+                }
+            }
+            continue;
+        }
+
+        // Synced — compare against expected.
+        const uint8_t* expected =
+            &k_expected_tone[s_verify_pos * EXPECTED_TONE_FRAME_BYTES];
+        if (memcmp(sample, expected, EXPECTED_TONE_FRAME_BYTES) != 0) {
+            s_verify_errors++;
+            if (s_verify_errors <= 5) {
+                ESP_LOGW(TAG, "VERIFY: err at pos=%u sample=%02X%02X%02X "
+                              "%02X%02X%02X expected=%02X%02X%02X %02X%02X%02X "
+                              "(checked=%u)",
+                         (unsigned)s_verify_pos,
+                         sample[0], sample[1], sample[2],
+                         sample[3], sample[4], sample[5],
+                         expected[0], expected[1], expected[2],
+                         expected[3], expected[4], expected[5],
+                         (unsigned)s_verify_total_checked);
+            }
+            // Re-sync from this point.
+            s_verify_synced = false;
+            sync_run_count = 0;
+            memcpy(sync_run, sample, EXPECTED_TONE_FRAME_BYTES);
+            sync_run_count = 1;
+            continue;
+        }
+        s_verify_total_checked++;
+        s_verify_pos = (s_verify_pos + 1) % EXPECTED_TONE_FRAMES;
+    }
+
+    // Periodic summary log every ~24000 frames (~0.5 s at 48 kHz).
+    static uint32_t since_log = 0;
+    since_log += num_frames;
+    if (since_log >= 24000) {
+        ESP_LOGI(TAG, "VERIFY: checked=%u errors=%u synced=%d",
+                 (unsigned)s_verify_total_checked,
+                 (unsigned)s_verify_errors,
+                 s_verify_synced ? 1 : 0);
+        since_log = 0;
+    }
 }
 
 const char* uac_get_status_string(void) {
