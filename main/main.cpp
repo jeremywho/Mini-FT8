@@ -4630,7 +4630,12 @@ static void load_station_data() {
   }
   rebuild_active_bands();
   rebuild_ignore_prefixes();
-  g_beacon = BeaconMode::OFF; // force off on load
+  // TEST BENCH: hardcode beacon ODD so the first 15s slot boundary
+  // after boot fires a TX (parity = (now_ms / 15000) & 1; with RTC at
+  // 0 right after boot, slot 1 at t=15s is odd). Drives the speaker
+  // pump against the QMX impersonator's CDC + UAC loopback so we can
+  // verify what we put on the OUT wire byte-for-byte.
+  g_beacon = BeaconMode::ODD;
   apply_ble_enabled_policy(false);
 }
 
@@ -5154,8 +5159,11 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   // free bytes look sufficient. Living with NimBLE-first means USB host
   // has to fit alongside its fragments; the s_usb_buffer halving (4608
   // -> 2304) frees enough DMA-capable headroom for CDC pipe alloc.
-  init_bluetooth();
-  apply_ble_enabled_policy(true);
+  // TEST BENCH: BLE disabled to A/B against the previous validated run.
+  // If mic enum + verify works without BLE, BLE preemption is the cause
+  // of the 5s control transfer timeout. Re-enable for production.
+  // init_bluetooth();
+  // apply_ble_enabled_policy(true);
   apply_radio_profile_binding();
   update_autoseq_cq_type();
 

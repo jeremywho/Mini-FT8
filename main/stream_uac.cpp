@@ -163,6 +163,12 @@ static const uint8_t k_expected_tone[EXPECTED_TONE_BYTES] = {
 };
 
 // Mic loopback verification state (matches reference's verify_samples).
+// s_verify_active gates the comparator so we only count errors during TX
+// windows when the QMX impersonator is echoing our OUT samples back.
+// At all other times mic carries whatever the impersonator emits idle
+// (silence / its own LUT / random) and would otherwise be counted as
+// noise.
+static volatile bool s_verify_active = false;
 static bool     s_verify_synced = false;
 static uint32_t s_verify_pos = 0;
 static uint32_t s_verify_total_checked = 0;
@@ -179,6 +185,7 @@ static uac_active_format_t s_format = {
     .channels = UAC_CHANNELS,
 };
 static bool s_cdc_installed = false;
+static bool s_cdc_install_pending = false;
 static int s_cdc_iface = -1;
 static int s_cdc_iface_hint = -1;
 static int64_t s_cdc_last_attempt_ms = 0;
@@ -507,13 +514,15 @@ static void usb_lib_task(void* arg) {
         .xCoreID = 0,
         .new_dev_cb = cdc_new_dev_cb,
     };
-    err = cdc_acm_host_install(&cdc_cfg);
-    if (err == ESP_OK) {
-        s_cdc_installed = true;
-        ESP_LOGI(TAG, "CDC-ACM driver installed");
-    } else {
-        ESP_LOGW(TAG, "CDC-ACM driver install failed: %s", esp_err_to_name(err));
-    }
+    // TEST BENCH: defer CDC-ACM install until AFTER UAC mic stream is up.
+    // With both class drivers running concurrently during enumeration the
+    // QMX impersonator's UAC SET_INTERFACE control transfer times out at
+    // 5s — looks like a class-driver race on composite devices. Install
+    // path moved to a flag-driven late install in uac_lib_task.
+    (void)cdc_cfg;
+    s_cdc_installed = false;
+    s_cdc_install_pending = true;
+    ESP_LOGI(TAG, "CDC-ACM install deferred (pending mic stream)");
 
     xTaskNotifyGive((TaskHandle_t)arg);
 
@@ -660,6 +669,29 @@ static void uac_lib_task(void* arg) {
                             started = true;
                             ESP_LOGI(TAG, "Selected stream format: %dHz, %d-bit, %dch",
                                      s_format.sample_freq, s_format.bit_resolution, s_format.channels);
+                            // TEST BENCH: install CDC-ACM driver now that
+                            // UAC mic SET_INTERFACE has completed. With
+                            // both drivers active during the initial
+                            // enumeration of the QMX impersonator, a class-
+                            // driver race timed out the UAC SET_INTERFACE
+                            // at 5s. Late install side-steps it.
+                            if (s_cdc_install_pending) {
+                                const cdc_acm_host_driver_config_t late_cfg = {
+                                    .driver_task_stack_size = 3072,
+                                    .driver_task_priority = 4,
+                                    .xCoreID = 0,
+                                    .new_dev_cb = cdc_new_dev_cb,
+                                };
+                                esp_err_t cerr = cdc_acm_host_install(&late_cfg);
+                                if (cerr == ESP_OK) {
+                                    s_cdc_installed = true;
+                                    ESP_LOGI(TAG, "CDC-ACM driver installed (late)");
+                                } else {
+                                    ESP_LOGW(TAG, "CDC-ACM late install failed: %s",
+                                             esp_err_to_name(cerr));
+                                }
+                                s_cdc_install_pending = false;
+                            }
                             break;
                         }
                         ESP_LOGW(TAG, "Stream candidate failed: %s", esp_err_to_name(err));
@@ -808,6 +840,17 @@ static void stream_uac_task(void* arg) {
                 ESP_LOGW(TAG, "USB read error: %s", esp_err_to_name(ret));
             }
             continue;
+        }
+
+        // TEST BENCH: byte-level verify against k_expected_tone whenever
+        // the speaker pump is running. The QMX impersonator echoes our
+        // OUT samples back via mic IN, so a mismatch tells us the OUT
+        // path is putting wrong bytes on the wire — the same direct
+        // signal the standalone uac_host validator uses.
+        if (s_verify_active) {
+            verify_mic_samples(usb_buffer, bytes_read,
+                               s_format.bit_resolution / 8 * s_format.channels,
+                               s_format.channels);
         }
 
         int frame_bytes = (s_format.bit_resolution / 8) * s_format.channels;
@@ -1151,6 +1194,13 @@ bool uac_tx_test_start(void) {
     s_spk_packets_sent = 0;
     s_spk_write_errors = 0;
 
+    // Reset mic verifier state so this TX window's errors are clean.
+    s_verify_synced = false;
+    s_verify_pos = 0;
+    s_verify_total_checked = 0;
+    s_verify_errors = 0;
+    s_verify_samples_since_connect = 0;
+
     uac_host_device_config_t cfg = {};
     cfg.addr = s_spk_addr;
     cfg.iface_num = s_spk_iface;
@@ -1190,12 +1240,19 @@ bool uac_tx_test_start(void) {
         return false;
     }
 
+    s_verify_active = true;
     ESP_LOGI(TAG, "uac_tx_test: streaming 1.5 kHz tone at full scale");
     return true;
 }
 
 void uac_tx_test_stop(void) {
     if (!s_spk_writer_task && !s_spk_handle) return;
+
+    s_verify_active = false;
+    ESP_LOGI(TAG, "uac_tx_test: VERIFY final checked=%u errors=%u synced=%d",
+             (unsigned)s_verify_total_checked,
+             (unsigned)s_verify_errors,
+             s_verify_synced ? 1 : 0);
 
     s_spk_writer_stop = true;
     for (int i = 0; i < 50 && s_spk_writer_task; ++i) {
