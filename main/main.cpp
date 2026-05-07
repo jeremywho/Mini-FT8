@@ -2859,9 +2859,19 @@ static void advance_active_band(int delta) {
 }
 
 static void fft_waterfall_tx_tone(uint8_t tone) {
-  // Map tone 0-7 to screen width and push a bright bin
+  // Render the actual transmitted FT8 tone at its real audio frequency
+  // bin (g_tx_base_hz + 6.25 Hz * tone), using the same Hz->pixel
+  // mapping as the mic-side waterfall (f_min=200, f_max=2900, 240 px
+  // wide). Effect: a high-SNR replica of what a clean receiver would
+  // show during this transmission — own message may even be decoded
+  // back via the mic loopback if the impersonator/QMX echoes audio.
+  // Previous implementation used `tone * 240 / 8`, which spread the 8
+  // tones uniformly across the whole row (visual scatter); the new
+  // mapping clusters the 8 tones into the ~4-pixel band actually
+  // occupied by the FT8 signal.
   std::array<uint8_t, 240> row{};
-  int pos = (int)((tone * row.size()) / 8);
+  float hz = (float)g_tx_base_hz + 6.25f * (float)tone;
+  int pos = (int)((hz - 200.0f) * (float)row.size() / (2900.0f - 200.0f));
   if (pos < 0) pos = 0;
   if (pos >= (int)row.size()) pos = (int)row.size() - 1;
   row[pos] = 200;
