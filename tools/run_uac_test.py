@@ -40,8 +40,14 @@ def open_uart():
     return serial.Serial(UART_PORT, UART_BAUD, timeout=0.1)
 
 
-def capture(ser, seconds):
+def capture(ser, seconds, keys_after_s=None, keys=None):
+    """Capture UART for `seconds`. If `keys` is provided, after
+    `keys_after_s` has elapsed write each character to the serial port
+    with a short delay between them so the firmware menu has time to
+    process each press."""
     deadline = time.time() + seconds
+    keys_deadline = (time.time() + keys_after_s) if keys_after_s else None
+    keys_sent = False
     buf = bytearray()
     while time.time() < deadline:
         chunk = ser.read(4096)
@@ -49,6 +55,13 @@ def capture(ser, seconds):
             buf.extend(chunk)
             sys.stdout.write(chunk.decode("utf-8", errors="replace"))
             sys.stdout.flush()
+        if keys and not keys_sent and keys_deadline and time.time() >= keys_deadline:
+            print(f"\n[harness] sending keys: {keys!r}\n", flush=True)
+            for ch in keys:
+                ser.write(ch.encode("ascii"))
+                ser.flush()
+                time.sleep(0.4)  # let firmware process each press
+            keys_sent = True
     return buf.decode("utf-8", errors="replace")
 
 
@@ -94,7 +107,10 @@ def main():
         sys.exit(rc)
 
     print(f"\n--- capturing UART for {capture_s}s ---\n")
-    log = capture(ser, capture_s)
+    # After 8s (UAC enum + QMX sync done), send 'S 1 S' to enable
+    # beacon EVEN. This lets the harness drive an actual TX cycle
+    # without manual interaction.
+    log = capture(ser, capture_s, keys_after_s=8.0, keys="S1S")
     ser.close()
 
     summarize(log)
