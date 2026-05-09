@@ -61,6 +61,7 @@ extern "C" {
 #include "driver/sdspi_host.h"
 #include "sdmmc_cmd.h"
 #include "esp_vfs_fat.h"
+#include "esp_spiffs.h"
 #include "esp_partition.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
@@ -1067,6 +1068,7 @@ static void enter_msc_mode(const char* reason);
 static void host_handle_line(const std::string& line);
 void save_station_data();  // visible to core_api.cpp
 static bool storage_is_mounted();
+static bool storage_supports_msc();
 static void unmount_storage();
 
 // Deferred-save flag. core_api.cpp's RPC handlers (running on the
@@ -2154,6 +2156,12 @@ static bool is_kh1_radio(RadioType r) {
 }
 
 static bool radio_type_uses_display_only(RadioType r) {
+  // Always use display-only board init (upstream design): audio input is owned
+  // exclusively by the selected backend (UAC for QMX/KH1-USBC, native I2S mic
+  // for KH1-MIC), so general M5Unified startup must not claim speaker/mic/audio
+  // resources. The keyboard still works because beginDisplayOnly() initializes
+  // it via Keyboard.begin() (auto-detects board type) — see
+  // components/M5Cardputer/src/M5Cardputer.cpp.
   (void)r;
   return true;
 }
@@ -5554,8 +5562,20 @@ static constexpr int64_t kQmxDetectTimeoutMs = 10000;
 // Switch to MSC (USB Mass Storage) mode. This is a one-way transition:
 // BLE controller memory is released and USB-OTG is re-claimed as a device
 // port until reboot.
+//
+// Gated on the storage backend: TinyUSB MSC needs a wear-levelled FAT volume,
+// so on launcher-installed images (legacy SPIFFS partition) MSC is
+// unavailable. In that case we just log a warning and stay in the current
+// UI mode — never enter UIMode::MSC, which would otherwise trap all
+// keypresses as reboot triggers and show stale "USB drive mounted" text
+// without the actual device-mode driver running.
 static void enter_msc_mode(const char* reason) {
   g_qmx_detect_active = false;
+  if (!storage_supports_msc()) {
+    ESP_LOGW(TAG, "MSC requested (%s) but storage backend is SPIFFS — MSC unavailable on launcher installs", reason);
+    debug_log_line("MSC needs FAT storage");
+    return;
+  }
   ESP_LOGI(TAG, "Entering MSC mode: %s", reason);
   debug_log_line("Entering MSC mode");
   audio_source_stop();
@@ -5672,32 +5692,93 @@ static void begin_usb_host_mode() {
   }
 }
 
-static wl_handle_t s_storage_wl_handle = WL_INVALID_HANDLE;
+// Storage backend is detected at runtime so a single binary works under both
+// deployment paths:
+//   - esptool full-flash: writes our partition table → "storage" FAT partition
+//     present → FAT mount + MSC log export available.
+//   - M5Launcher OTA install: launcher's bootloader keeps its resident partition
+//     table (legacy "spiffs" SPIFFS partition) → SPIFFS mount, MSC unavailable.
+// Mount path stays "/storage" in both cases so call sites don't care which
+// backend is underneath. MSC is gated on FAT being present (see enter_msc_mode).
+enum class StorageBackend : uint8_t { NONE, FAT, SPIFFS };
+static StorageBackend     s_storage_backend  = StorageBackend::NONE;
+static bool               s_storage_mounted  = false;
+static wl_handle_t        s_storage_wl_handle = WL_INVALID_HANDLE;
+
+static StorageBackend detect_storage_backend() {
+  if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                               ESP_PARTITION_SUBTYPE_DATA_FAT, "storage")) {
+    return StorageBackend::FAT;
+  }
+  if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                               ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "spiffs")) {
+    return StorageBackend::SPIFFS;
+  }
+  return StorageBackend::NONE;
+}
 
 static bool storage_is_mounted() {
-  return s_storage_wl_handle != WL_INVALID_HANDLE;
+  return s_storage_mounted;
+}
+static bool storage_supports_msc() {
+  return s_storage_backend == StorageBackend::FAT;
 }
 
 static esp_err_t mount_storage() {
   if (storage_is_mounted()) return ESP_OK;
 
-  esp_vfs_fat_mount_config_t mount_config = {};
-  mount_config.format_if_mount_failed = true;
-  mount_config.max_files = 3;
-  mount_config.allocation_unit_size = 4096;
-
-  esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(
-      "/storage", "storage", &mount_config, &s_storage_wl_handle);
-  if (err != ESP_OK) {
-    s_storage_wl_handle = WL_INVALID_HANDLE;
+  s_storage_backend = detect_storage_backend();
+  switch (s_storage_backend) {
+    case StorageBackend::FAT: {
+      esp_vfs_fat_mount_config_t mount_config = {};
+      mount_config.format_if_mount_failed = true;
+      mount_config.max_files = 3;
+      mount_config.allocation_unit_size = 4096;
+      esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(
+          "/storage", "storage", &mount_config, &s_storage_wl_handle);
+      if (err == ESP_OK) {
+        s_storage_mounted = true;
+        ESP_LOGI("STORAGE", "Mounted FAT partition 'storage' at /storage (MSC available)");
+      } else {
+        s_storage_wl_handle = WL_INVALID_HANDLE;
+      }
+      return err;
+    }
+    case StorageBackend::SPIFFS: {
+      esp_vfs_spiffs_conf_t conf = {};
+      conf.base_path = "/storage";
+      conf.partition_label = "spiffs";
+      conf.max_files = 5;
+      conf.format_if_mount_failed = true;
+      esp_err_t err = esp_vfs_spiffs_register(&conf);
+      if (err == ESP_OK) {
+        s_storage_mounted = true;
+        ESP_LOGI("STORAGE", "Mounted SPIFFS partition 'spiffs' at /storage (MSC unavailable on launcher install)");
+      }
+      return err;
+    }
+    case StorageBackend::NONE:
+    default:
+      ESP_LOGE("STORAGE", "No storage partition found (neither FAT 'storage' nor SPIFFS 'spiffs')");
+      return ESP_ERR_NOT_FOUND;
   }
-  return err;
 }
 
 static void unmount_storage() {
   if (!storage_is_mounted()) return;
-  esp_vfs_fat_spiflash_unmount_rw_wl("/storage", s_storage_wl_handle);
-  s_storage_wl_handle = WL_INVALID_HANDLE;
+  switch (s_storage_backend) {
+    case StorageBackend::FAT:
+      esp_vfs_fat_spiflash_unmount_rw_wl("/storage", s_storage_wl_handle);
+      s_storage_wl_handle = WL_INVALID_HANDLE;
+      break;
+    case StorageBackend::SPIFFS:
+      esp_vfs_spiffs_unregister("spiffs");
+      break;
+    case StorageBackend::NONE:
+    default:
+      break;
+  }
+  s_storage_mounted = false;
 }
 
 static void app_task_core0(void* /*param*/) {
@@ -5941,13 +6022,21 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
     // No-QMX fallback: if begin_usb_host_mode armed the timer and nothing
     // has enumerated by the deadline, switch to MSC so a button-less
-    // StampS3Bat can still expose logs to the host PC.
+    // StampS3Bat can still expose logs to the host PC. Only fires when the
+    // storage backend is FAT (esptool full-flash deployments). On launcher
+    // installs (SPIFFS backend) MSC is not functional, so we just clear the
+    // flag and stay in normal RX UI — the user can still drive menus / BLE.
     if (g_qmx_detect_active) {
       if (audio_source_qmx_detected()) {
         g_qmx_detect_active = false;
         ESP_LOGI(TAG, "QMX detected; staying in USB host mode");
       } else if (esp_timer_get_time() / 1000 >= g_qmx_detect_deadline_ms) {
-        enter_msc_mode("no QMX after 10s");
+        if (storage_supports_msc()) {
+          enter_msc_mode("no QMX after 10s");
+        } else {
+          g_qmx_detect_active = false;
+          ESP_LOGI(TAG, "No QMX detected after 10s — staying in RX (MSC unavailable on launcher install)");
+        }
       }
     }
 
