@@ -3,18 +3,20 @@
 #include <M5Cardputer.h>
 #include <cstring>
 #include "freertos/semphr.h"
+#include "esp_heap_caps.h"
 
-static constexpr int SCREEN_W = 240;
-static constexpr int SCREEN_H = 135;
-// Layout: 18px waterfall, 3px countdown bar, 6 lines: each 16px text + 3px gap
-static constexpr int WATERFALL_H = 18;
-static constexpr int COUNTDOWN_H = 3;
-static constexpr int RX_LINES = 6;
 static bool ui_paused = false;      // waterfall updates paused
 
 static uint8_t waterfall[WATERFALL_H][SCREEN_W];
 static int waterfall_head = 0;
 static bool waterfall_dirty = false;
+
+// Off-screen RGB565 frame buffer for bulk-blit waterfall rendering.
+// Replaces 4,320 individual drawPixel() SPI calls (~43 ms) with a single
+// pushImage() burst (~1 ms), keeping the main loop under its 2 ms TX budget.
+// 240 × 18 × 2 = 8,640 bytes allocated from heap in ui_init() (before NimBLE
+// starts) so it does not count against the static DRAM budget that BLE needs.
+static uint16_t* wf_fb = nullptr;
 
 // Static RX list — zero-heap display pipeline
 static RxDecodeEntry rx_lines[RX_MAX_DECODES];
@@ -58,6 +60,11 @@ static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
 void ui_set_paused(bool paused) { ui_paused = paused; }
 bool ui_is_paused() { return ui_paused; }
 
+// When true, ui_push_waterfall_row() from the RX audio pipeline is silenced.
+// ui_push_tx_waterfall_row() bypasses this flag so TX tone markers always appear.
+static bool s_rx_waterfall_muted = false;
+void ui_set_rx_waterfall_muted(bool muted) { s_rx_waterfall_muted = muted; }
+
 bool ui_waterfall_dirty() { return waterfall_dirty; }
 void ui_draw_waterfall_if_dirty() { if (waterfall_dirty) ui_draw_waterfall(); }
 
@@ -65,7 +72,7 @@ void ui_draw_waterfall_if_dirty() { if (waterfall_dirty) ui_draw_waterfall(); }
 // slot_colors: optional per-line slot parity (0 even, 1 odd) for coloring text
 void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, int page, int selected, const std::vector<bool>& mark_delete, const std::vector<int>& slot_colors) {
     const int line_h = 19; // 16 text + 3 gap
-    const int start_y = WATERFALL_H + COUNTDOWN_H + 3;
+    const int start_y = UI_START_Y;
 
     DispGuard guard;
     M5.Display.startWrite();
@@ -109,6 +116,18 @@ void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, 
 
 void ui_init(bool display_only) {
     g_disp_mutex = xSemaphoreCreateMutex();
+
+    // Allocate the waterfall frame buffer from heap here — before NimBLE starts —
+    // so the allocation succeeds while DRAM is unfragmented.  Static BSS would
+    // consume 8,640 bytes from the fixed DRAM pool that BLE also draws from.
+    if (!wf_fb) {
+        wf_fb = static_cast<uint16_t*>(
+            heap_caps_malloc(WATERFALL_H * SCREEN_W * sizeof(uint16_t), MALLOC_CAP_DEFAULT));
+        if (wf_fb) {
+            memset(wf_fb, 0, WATERFALL_H * SCREEN_W * sizeof(uint16_t));
+        }
+    }
+
     if (display_only) {
         // KH1-MIC needs display-only board init: full M5Unified startup can
         // claim ES8311/I2S audio resources before the native mic path opens them.
@@ -133,7 +152,8 @@ void ui_set_waterfall_row(int row, const uint8_t* bins, int len) {
     memcpy(waterfall[row], bins, len);
 }
 
-void ui_push_waterfall_row(const uint8_t* bins, int len) {
+// Internal: push one row unconditionally (respects ui_paused, ignores mute).
+static void push_waterfall_row_impl(const uint8_t* bins, int len) {
     if (ui_paused) return;
     if (len > SCREEN_W) len = SCREEN_W;
     memcpy(waterfall[waterfall_head], bins, len);
@@ -142,6 +162,19 @@ void ui_push_waterfall_row(const uint8_t* bins, int len) {
     }
     waterfall_head = (waterfall_head + 1) % WATERFALL_H;
     waterfall_dirty = true;
+}
+
+// Called by audio RX pipeline — suppressed during TX so received-spectrum
+// pixels don't mix with TX tone markers.
+void ui_push_waterfall_row(const uint8_t* bins, int len) {
+    if (s_rx_waterfall_muted) return;
+    push_waterfall_row_impl(bins, len);
+}
+
+// Called by the TX tone synthesiser — always pushes regardless of mute so
+// TX tone markers appear even when the RX audio path is silenced.
+void ui_push_tx_waterfall_row(const uint8_t* bins, int len) {
+    push_waterfall_row_impl(bins, len);
 }
 
 void ui_clear_waterfall() {
@@ -156,20 +189,30 @@ void ui_clear_waterfall() {
 void ui_draw_waterfall() {
     waterfall_dirty = false;
     if (ui_paused) return;
-    DispGuard guard;
-    int dst_y = 0;
+
+    // Phase 1: convert intensity → RGB565 into the off-screen frame buffer.
+    // Pure CPU work with no SPI traffic; no lock needed (wf_fb is only written here).
+    // Guard against unlikely allocation failure (device keeps running, waterfall blank).
+    if (!wf_fb) return;
+    //
+    // LovyanGFX pushImage(uint16_t*) sends bytes straight from memory without
+    // swapping — it expects data already in big-endian (wire) order.  Our
+    // rgb565() returns little-endian uint16_t, so we must bswap16 each value
+    // when storing.  Example: yellow = rgb565(v,v,0) = 0xFFE0; stored LE as
+    // [0xE0,0xFF]; without swap SPI sends 0xE0FF → purple.  After bswap16,
+    // stored as [0xFF,0xE0]; SPI sends 0xFFE0 → yellow.
     for (int i = 0; i < WATERFALL_H; ++i) {
         int src = (waterfall_head + i) % WATERFALL_H;
         for (int x = 0; x < SCREEN_W; ++x) {
             uint8_t v = waterfall[src][x];
-            // Yellow gradient on black background
-            uint8_t r = v;
-            uint8_t g = v;
-            uint8_t b = 0;
-            uint16_t c = rgb565(r, g, b);
-            M5.Display.drawPixel(x, dst_y + i, c);
+            wf_fb[i * SCREEN_W + x] = __builtin_bswap16(rgb565(v, v, 0));  // yellow, wire order
         }
     }
+
+    // Phase 2: single pushImage() burst transfers all 4,320 pixels in one SPI
+    // transaction (~1 ms) instead of 4,320 individual drawPixel() calls (~43 ms).
+    DispGuard guard;
+    M5.Display.pushImage(0, 0, SCREEN_W, WATERFALL_H, wf_fb);
 }
 
 static inline int hz_to_x(int hz) {
@@ -303,7 +346,7 @@ static void draw_rx_line(int y, const RxDecodeEntry& l, int line_no, bool select
 void ui_draw_rx(int flash_index) {
     const int line_h = 19; // 16 text + 3 gap
     // Add a 3px gap below the countdown before the first line
-    const int start_y = WATERFALL_H + COUNTDOWN_H + 3;
+    const int start_y = UI_START_Y;
     // Only redraw when page changes or content changes, but always draw if list is empty
     if (rx_lines_count > 0 && flash_index < 0) {
         if (rx_page == last_page && last_drawn_count == rx_lines_count) {
@@ -386,7 +429,7 @@ int ui_handle_rx_key(char c) {
 // Simple numbered list drawing helper (6 lines/page), optional highlight by absolute index
 void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight_abs) {
     const int line_h = 19; // 16 text + 3 gap
-    const int start_y = WATERFALL_H + COUNTDOWN_H + 3;
+    const int start_y = UI_START_Y;
     DispGuard guard;
     M5.Display.startWrite();
     M5.Display.setTextSize(2);
@@ -409,7 +452,7 @@ void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight
 
 void ui_draw_debug(const std::vector<std::string>& lines, int page) {
     const int line_h = 19;
-    const int start_y = WATERFALL_H + COUNTDOWN_H + 3;
+    const int start_y = UI_START_Y;
     DispGuard guard;
     M5.Display.startWrite();
     M5.Display.setTextSize(2);

@@ -293,7 +293,7 @@ void core_get_config(StationConfig& out) {
   out.bands_hz.clear();
   out.bands_hz.reserve(g_bands.size());
   for (const auto& b : g_bands) {
-    out.bands_hz.push_back((uint32_t)b.freq * 1000u);  // BandItem.freq is kHz
+    out.bands_hz.push_back((uint32_t)(b.freq * 1000.0f + 0.5f));  // BandItem.freq is kHz (float)
   }
   out.band_idx    = g_band_sel;
 

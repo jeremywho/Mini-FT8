@@ -1,4 +1,5 @@
 #include "ft8_audio_pipeline.h"
+#include "protocol.h"
 
 #include <cmath>
 #include <cstring>
@@ -108,7 +109,7 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
         .sample_rate = FT8_SAMPLE_RATE,
         .time_osr = g_time_osr,
         .freq_osr = g_freq_osr,
-        .protocol = FTX_PROTOCOL_FT8
+        .protocol = g_protocol->protocol_id
     };
 
     log_heap("AUDIO_PIPE_BEFORE_MONITOR_INIT");
@@ -130,19 +131,22 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
         return;
     }
 
+    const int64_t slot_ms      = g_protocol->slot_time_ms;
+    const int     target_blocks = g_protocol->total_symbols + 1;
+    const uint32_t sym_delay_ms = (uint32_t)(g_protocol->symbol_period * 1000.0f + 0.5f);
+
     int64_t now_ms = rtc_now_ms();
-    int64_t rem = now_ms % 15000;
-    int64_t wait_ms = (rem < 100) ? 0 : (15000 - rem);
+    int64_t rem = now_ms % slot_ms;
+    int64_t wait_ms = (rem < 100) ? 0 : (slot_ms - rem);
     if (wait_ms > 0) {
         vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
     }
 
-    const int target_blocks = 80;
     int ft8_buffer_idx = 0;
     TickType_t next_wake = xTaskGetTickCount();
     int slot_blocks = 0;
-    int64_t slot_idx = rtc_now_ms() / 15000;
-    int64_t slot_start_ms = slot_idx * 15000;
+    int64_t slot_idx = rtc_now_ms() / slot_ms;
+    int64_t slot_start_ms = slot_idx * slot_ms;
     (void)slot_start_ms;
 
     while (!cfg->should_stop(cfg->ctx)) {
@@ -179,10 +183,10 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
                 }
 
                 ft8_buffer_idx = 0;
-                vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(160));
+                vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(sym_delay_ms));
 
                 slot_blocks++;
-                int64_t now_idx = rtc_now_ms() / 15000;
+                int64_t now_idx = rtc_now_ms() / slot_ms;
                 if (now_idx != slot_idx) {
                     ESP_LOGI(tag, "Slot boundary %lld->%lld blocks=%d wf=%d",
                              (long long)slot_idx, (long long)now_idx,
@@ -191,12 +195,13 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
                         g_decode_applied_slot_idx = slot_idx;
                     }
                     slot_idx = now_idx;
-                    slot_start_ms = slot_idx * 15000;
+                    slot_start_ms = slot_idx * slot_ms;
                     slot_blocks = 0;
                     mon.wf.num_blocks = 0;
                     monitor_reset(&mon);
                     next_wake = xTaskGetTickCount();
-                } else if (slot_blocks >= 79 && mon.wf.num_blocks >= 79) {
+                } else if (slot_blocks >= g_protocol->total_symbols &&
+                           mon.wf.num_blocks >= g_protocol->total_symbols) {
                     ESP_LOGI(tag, "Triggering decode at slot %lld blocks=%d wf=%d",
                              (long long)slot_idx, slot_blocks, mon.wf.num_blocks);
                     if (g_decode_enabled) {

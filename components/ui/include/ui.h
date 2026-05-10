@@ -3,6 +3,18 @@
 #include <string>
 #include <stdint.h>
 
+// ---------------------------------------------------------------------------
+// Screen layout constants — shared between ui.cpp and callers that need to
+// position content relative to the waterfall / countdown areas.
+// ---------------------------------------------------------------------------
+#define SCREEN_W    240
+#define SCREEN_H    135
+#define WATERFALL_H  18    ///< Pixel height of the waterfall strip
+#define COUNTDOWN_H   3    ///< Pixel height of the TX countdown bar
+#define RX_LINES      6    ///< Visible text rows below the countdown bar
+/// Y-coordinate where the text area begins (below waterfall + countdown).
+#define UI_START_Y  (WATERFALL_H + COUNTDOWN_H)   // 21 px
+
 // A lightweight RX line format you can fill from your decoder
 struct UiRxLine {
     std::string text;  // already formatted for display
@@ -37,8 +49,12 @@ struct RxDecodeEntry {
 
 void ui_init(bool display_only = false);
 void ui_set_waterfall_row(int row, const uint8_t* bins, int len);
-// Push a new row into the waterfall ring buffer (advances head). UI task must flush.
+// Push a new row from the RX audio pipeline.  Suppressed during TX (see ui_set_rx_waterfall_muted).
 void ui_push_waterfall_row(const uint8_t* bins, int len);
+// Push a TX tone marker row — always visible regardless of mute state.
+void ui_push_tx_waterfall_row(const uint8_t* bins, int len);
+// Mute/unmute incoming RX waterfall rows.  Call with true when TX starts, false when TX ends.
+void ui_set_rx_waterfall_muted(bool muted);
 void ui_clear_waterfall();
 void ui_draw_waterfall();
 void ui_draw_waterfall_if_dirty();

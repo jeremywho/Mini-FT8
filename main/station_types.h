@@ -32,7 +32,8 @@ enum class RadioType {
 };
 
 // One entry in the band list (name + frequency in kHz).
+// float to support FT4 frequencies with .5 kHz offsets (e.g. 40m FT4 = 7047.5 kHz).
 struct BandItem {
     const char* name;
-    int freq;  // kHz
+    float freq;  // kHz
 };
