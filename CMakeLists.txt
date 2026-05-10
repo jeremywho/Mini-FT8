@@ -4,16 +4,11 @@ cmake_minimum_required(VERSION 3.16)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(mini_ft8)
-# Normal idf.py flash preserves the existing storage partition. The release
-# merged image includes a blank SPIFFS image so esptool full-flash installs get
-# the current launcher-compatible storage layout.
-spiffs_create_partition_image(spiffs ${CMAKE_SOURCE_DIR}/spiffs_image)
-partition_table_get_partition_info(spiffs_offset "--partition-name spiffs" "offset")
-add_dependencies(app spiffs_spiffs_bin)
-
-# Automatically generate a single merged binary file (like in the release directory) after every build
+# Normal idf.py flash preserves the existing storage partition. The merged
+# release image also leaves SPIFFS untouched; first boot after repartition can
+# format SPIFFS if mount fails.
 add_custom_command(TARGET app POST_BUILD
-    COMMAND ${PYTHON} -m esptool --chip esp32s3 merge_bin -o "MiniFT8_Merged_Auto.bin" @flash_args ${spiffs_offset} spiffs.bin
+    COMMAND ${PYTHON} -m esptool --chip esp32s3 merge_bin -o "MiniFT8_Merged_Auto.bin" @flash_args
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Auto-generating merged binary MiniFT8_Merged_Auto.bin for release..."
 )
