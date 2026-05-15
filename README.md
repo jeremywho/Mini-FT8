@@ -1,6 +1,4 @@
-Join [https://groups.io/g/qrp-portable](https://groups.io/g/qrp-portable) for announcements,updates & discussion
-
-Also see [PaperFT8](https://github.com/wcheng95/PaperFT8) (Work in progress)
+Also see [PaperFT8](https://github.com/wcheng95/PaperFT8)
 
 # First POTA activation (v1.0 2025-12-31)
 ![First POTA Activation](IMG_6087.jpeg)
