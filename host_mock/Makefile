@@ -43,9 +43,14 @@ clean:
 SYNTH_TARGET = host_synth_test
 SYNTH_SRC = test_ft8_synth.cpp
 SYNTH_OBJ = $(SYNTH_SRC:.cpp=.o)
+SYNTH_CXXFLAGS = $(CXXFLAGS) -I../main
 
 $(SYNTH_TARGET): $(SYNTH_OBJ)
-	$(CXX) $(CXXFLAGS) -o $@ $^
+	$(CXX) $(SYNTH_CXXFLAGS) -o $@ $^
+
+# Explicit rule wins over %.o: %.cpp — ensures -I../main is used for this file.
+test_ft8_synth.o: test_ft8_synth.cpp
+	$(CXX) $(SYNTH_CXXFLAGS) -c $< -o $@
 
 synth: $(SYNTH_TARGET)
 
