@@ -70,6 +70,8 @@ int main(int argc, char* argv[]) {
     (void)argc; (void)argv;
     int fails = 0;
     fails += test_fixture("cq", fixture_cq);
+    fails += test_fixture("report", fixture_report);
+    fails += test_fixture("73", fixture_73);
     if (fails == 0) printf("ALL OK\n");
     return fails ? 1 : 0;
 }
