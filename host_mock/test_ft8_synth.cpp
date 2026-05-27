@@ -66,12 +66,28 @@ static int test_fixture(const char* name, const uint8_t* tones) {
     return compare_byte_exact(name, got, ref);
 }
 
+static int test_byte_stuffing(const char* name, const uint8_t* tones) {
+    std::vector<uint8_t> stuffed(FT8_TX_SYNTH_SAMPLES);
+    ft8_tx_synth_render(tones, 1500.0f, stuffed.data(), true);
+    int count_3b = 0;
+    for (uint8_t b : stuffed) if (b == 0x3B) ++count_3b;
+    if (count_3b == 0) {
+        printf("[%s/stuff] PASS: no 0x3B bytes in stuffed output\n", name);
+        return 0;
+    }
+    printf("[%s/stuff] FAIL: %d 0x3B bytes present\n", name, count_3b);
+    return 1;
+}
+
 int main(int argc, char* argv[]) {
     (void)argc; (void)argv;
     int fails = 0;
     fails += test_fixture("cq", fixture_cq);
     fails += test_fixture("report", fixture_report);
     fails += test_fixture("73", fixture_73);
+    fails += test_byte_stuffing("cq", fixture_cq);
+    fails += test_byte_stuffing("report", fixture_report);
+    fails += test_byte_stuffing("73", fixture_73);
     if (fails == 0) printf("ALL OK\n");
     return fails ? 1 : 0;
 }
