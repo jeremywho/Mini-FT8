@@ -147,6 +147,8 @@ host_mock/Makefile              — host_synth_test target (Phase 1 only)
 
 **Done when:** `make host_synth_test && ./host_synth_test` passes for all three canned fixtures (CQ, signal report, 73) with zero byte differences against `tools/ft8_synth_reference.py` output, with `apply_byte_stuffing = false`. Stuffing path additionally checked by `grep -c '\x3B'` returning 0 on the stuffed output.
 
+> **Status: PHASE 1 COMPLETE.** Tagged `phase-1-done` at commit `f9599f9`. All 9 tests pass (3 golden, 3 stuffing, 3 stream-equivalence) byte-exact against Python reference (numpy float32 + platform-libm sinf). Implementation: `main/ft8_tx_synth.{h,cpp}`. Reference: `tools/ft8_synth_reference.py`. Tests: `host_mock/test_ft8_synth.cpp`.
+
 **Public interface**
 
 ```c
