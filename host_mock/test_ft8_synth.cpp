@@ -79,6 +79,31 @@ static int test_byte_stuffing(const char* name, const uint8_t* tones) {
     return 1;
 }
 
+static int test_stream_equiv(const char* name, const uint8_t* tones) {
+    std::vector<uint8_t> oneshot(FT8_TX_SYNTH_SAMPLES);
+    ft8_tx_synth_render(tones, 1500.0f, oneshot.data(), false);
+
+    std::vector<uint8_t> streamed(FT8_TX_SYNTH_SAMPLES, 0);
+    ft8_tx_synth_stream_t st;
+    ft8_tx_synth_stream_init(&st, tones, 1500.0f, false);
+    int total = 0;
+    // Pull in irregular chunks to exercise boundary logic
+    int chunk_sizes[] = {500, 1, 1843, 7, 100000};
+    int cs_idx = 0;
+    while (!ft8_tx_synth_stream_done(&st) && total < FT8_TX_SYNTH_SAMPLES) {
+        int want = chunk_sizes[cs_idx++ % 5];
+        if (want > FT8_TX_SYNTH_SAMPLES - total) want = FT8_TX_SYNTH_SAMPLES - total;
+        int got = ft8_tx_synth_stream_pull(&st, streamed.data() + total, want);
+        if (got == 0) break;
+        total += got;
+    }
+    if (total != FT8_TX_SYNTH_SAMPLES) {
+        printf("[%s/stream] FAIL: pulled %d / %d\n", name, total, FT8_TX_SYNTH_SAMPLES);
+        return 1;
+    }
+    return compare_byte_exact((std::string(name) + "/stream").c_str(), streamed, oneshot);
+}
+
 int main(int argc, char* argv[]) {
     (void)argc; (void)argv;
     int fails = 0;
@@ -88,6 +113,9 @@ int main(int argc, char* argv[]) {
     fails += test_byte_stuffing("cq", fixture_cq);
     fails += test_byte_stuffing("report", fixture_report);
     fails += test_byte_stuffing("73", fixture_73);
+    fails += test_stream_equiv("cq", fixture_cq);
+    fails += test_stream_equiv("report", fixture_report);
+    fails += test_stream_equiv("73", fixture_73);
     if (fails == 0) printf("ALL OK\n");
     return fails ? 1 : 0;
 }
