@@ -38,3 +38,18 @@ clean:
 	rm -f $(OBJ) $(TARGET)
 
 .PHONY: all clean
+
+# Phase 1 standalone synth test (no FreeRTOS, no autoseq)
+SYNTH_TARGET = host_synth_test
+SYNTH_SRC = test_ft8_synth.cpp
+SYNTH_OBJ = $(SYNTH_SRC:.cpp=.o)
+
+$(SYNTH_TARGET): $(SYNTH_OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
+synth: $(SYNTH_TARGET)
+
+clean_synth:
+	rm -f $(SYNTH_OBJ) $(SYNTH_TARGET)
+
+.PHONY: synth clean_synth
