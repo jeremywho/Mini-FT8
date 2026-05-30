@@ -464,7 +464,7 @@ static void uac_lib_task(void* arg) {
                         const uac_host_stream_config_t* cfg = &candidates[i];
                         ESP_LOGI(TAG, "Starting stream (profile=%s) candidate %d/%d: %dHz, %d-bit, %dch",
                                  profile_name(s_profile), i + 1, candidate_count,
-                                 cfg->sample_freq, cfg->bit_resolution, cfg->channels);
+                                 (int)cfg->sample_freq, (int)cfg->bit_resolution, (int)cfg->channels);
                         err = uac_host_device_start(handle, cfg);
                         if (err == ESP_OK) {
                             s_format.sample_freq = cfg->sample_freq;
@@ -472,7 +472,7 @@ static void uac_lib_task(void* arg) {
                             s_format.channels = cfg->channels;
                             started = true;
                             ESP_LOGI(TAG, "Selected stream format: %dHz, %d-bit, %dch",
-                                     s_format.sample_freq, s_format.bit_resolution, s_format.channels);
+                                     (int)s_format.sample_freq, (int)s_format.bit_resolution, (int)s_format.channels);
                             break;
                         }
                         ESP_LOGW(TAG, "Stream candidate failed: %s", esp_err_to_name(err));

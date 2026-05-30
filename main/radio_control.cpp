@@ -10,6 +10,8 @@ static radio_control_backend_t s_backend = RADIO_CONTROL_QMX;
 
 static const radio_control_ops_t* current_ops(void) {
     switch (s_backend) {
+    case RADIO_CONTROL_TRUSDX_CAT:
+        return radio_control_trusdx_get_ops();
     case RADIO_CONTROL_KH1_CAT:
         return radio_control_kh1_get_ops();
     case RADIO_CONTROL_QMX:
@@ -34,6 +36,8 @@ const char* radio_control_backend_name(radio_control_backend_t backend) {
         return "qmx";
     case RADIO_CONTROL_KH1_CAT:
         return "kh1_cat";
+    case RADIO_CONTROL_TRUSDX_CAT:
+        return "trusdx_cat";
     default:
         return "unknown";
     }

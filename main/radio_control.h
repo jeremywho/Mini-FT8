@@ -11,6 +11,7 @@ extern "C" {
 typedef enum {
     RADIO_CONTROL_QMX = 0,
     RADIO_CONTROL_KH1_CAT = 1,
+    RADIO_CONTROL_TRUSDX_CAT = 2,
 } radio_control_backend_t;
 
 void radio_control_set_backend(radio_control_backend_t backend);
