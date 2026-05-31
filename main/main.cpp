@@ -4312,10 +4312,22 @@ static void draw_status_view() {
   BeaconMode disp_beacon = (ui_mode == UIMode::STATUS) ? g_status_beacon_temp : g_beacon;
   lines[0] = std::string("Beacon: ") + beacon_name(disp_beacon);
   lines[1] = status_sync_line();
-  lines[2] = std::string("Band: ") +
-             std::string(g_bands[g_band_sel].name) + " " +
-             std::to_string(g_bands[g_band_sel].freq);
-  lines[3] = std::string("Tune: ") + (g_tune ? "ON" : "OFF");
+  {
+    // DIAG: while streaming, show the truSDX resampler rates ("truSDX <in>-><out>")
+    // here so we can read the actually-compiled output rate on-screen.
+    const char* rxinfo = audio_source_get_debug_line1();
+    lines[2] = (rxinfo && rxinfo[0])
+               ? std::string(rxinfo)
+               : (std::string("Band: ") + std::string(g_bands[g_band_sel].name) + " " +
+                  std::to_string(g_bands[g_band_sel].freq));
+  }
+  {
+    // While a radio is streaming, show the live RX byte/sample counter here so
+    // we can see on-screen whether audio is actually arriving and resampling.
+    const char* rxdbg = audio_source_get_debug_line2();
+    lines[3] = (rxdbg && rxdbg[0]) ? (std::string("RX ") + rxdbg)
+                                   : (std::string("Tune: ") + (g_tune ? "ON" : "OFF"));
+  }
   if (status_edit_idx == 4 && !status_edit_buffer.empty()) {
     lines[4] = std::string("Date: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
   } else {

@@ -28,3 +28,8 @@ __pycache__/
 # macOS
 .DS_Store
 
+
+# local debug wifi channel (experimental/broken — kept on disk, not committed)
+main/wifi_debug_creds.h
+main/wifi_debug.cpp
+main/wifi_debug.h

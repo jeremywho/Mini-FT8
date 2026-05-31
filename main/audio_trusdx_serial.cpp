@@ -67,6 +67,7 @@ static TaskHandle_t s_tx_task_handle = nullptr;
 static volatile bool s_started = false;
 static volatile bool s_streaming = false;
 static volatile bool s_streaming_cat_mode = false;
+static volatile bool s_pure_audio_stream = false;  // UA1 = raw 8-bit audio, no ;CAT; framing
 static volatile bool s_stop_requested = false;
 static volatile bool s_connected = false;
 static volatile bool s_tune_on = false;
@@ -388,6 +389,13 @@ static bool parser_feed_byte(TrusdxParser* p, uint8_t b, float* out, int* out_co
 {
     if (!p) return false;
 
+    if (s_pure_audio_stream) {
+        // UA1 streams raw 8-bit audio with no ;CAT; framing, so a byte equal to
+        // 59 (';') is just an audio sample, not a delimiter. Treat all bytes as audio.
+        p->audio_since_log++;
+        return resampler_push(p, u8_to_float(b), out, out_count, max_samples);
+    }
+
     if (p->state == TrusdxStreamState::Audio) {
         if (b == ';') {
             p->state = TrusdxStreamState::CatToken;
@@ -471,8 +479,9 @@ static int trusdx_read_ft8_samples(void* ctx, float* out, int max_samples)
         std::snprintf(s_debug_line1, sizeof(s_debug_line1),
                       "truSDX %d->%d", TRUSDX_RX_SAMPLE_RATE, TRUSDX_RX_OUTPUT_RATE);
         std::snprintf(s_debug_line2, sizeof(s_debug_line2),
-                      "raw=%lu out=%lu",
+                      "r%lu a%lu o%lu",
                       (unsigned long)parser->raw_since_log,
+                      (unsigned long)parser->audio_since_log,
                       (unsigned long)parser->out_since_log);
         parser->raw_since_log = 0;
         parser->audio_since_log = 0;
@@ -559,6 +568,7 @@ bool trusdx_serial_start(void)
     s_tx_done = false;
     s_tx_failed = false;
     s_tx_cancel_requested = false;
+    s_pure_audio_stream = false;
     reset_parser();
     ft8_audio_pipeline_clear_latest_waterfall_row();
 
@@ -647,22 +657,14 @@ bool trusdx_serial_start(void)
         return false;
     }
 
-    ESP_LOGI(TAG, "send RX;");
-    err = trusdx_serial_send_cat("RX;", TRUSDX_CAT_TIMEOUT_MS);
+    // NOTE: the PC capture script (which streams reliably) sends MD2; then UA1;
+    // and never sends RX;. Sending RX; here appeared to leave the rig in a state
+    // where UA1; returns a reply but does not start the audio stream. Omit it.
+    ESP_LOGI(TAG, "send UA1;");
+    err = trusdx_serial_send_cat("UA1;", TRUSDX_CAT_TIMEOUT_MS);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "connect failed: RX %s", esp_err_to_name(err));
-        set_status("truSDX RX failed");
-        s_connected = false;
-        s_streaming_cat_mode = false;
-        s_ch340.end();
-        return false;
-    }
-
-    ESP_LOGI(TAG, "send UA2;");
-    err = trusdx_serial_send_cat("UA2;", TRUSDX_CAT_TIMEOUT_MS);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "connect failed: UA2 %s", esp_err_to_name(err));
-        set_status("truSDX UA2 failed");
+        ESP_LOGE(TAG, "connect failed: UA1 %s", esp_err_to_name(err));
+        set_status("truSDX UA1 failed");
         s_connected = false;
         s_streaming_cat_mode = false;
         s_ch340.end();
@@ -671,6 +673,7 @@ bool trusdx_serial_start(void)
 
     ESP_LOGI(TAG, "streaming mode enabled");
     s_streaming_cat_mode = true;
+    s_pure_audio_stream = true;  // UA1 stream is raw audio; parser must not treat 59 as ';'
     reset_parser();
 
     BaseType_t ret = xTaskCreatePinnedToCore(stream_task, "trusdx_rx",
@@ -710,6 +713,7 @@ void trusdx_serial_stop(void)
     s_streaming = false;
     s_connected = false;
     s_streaming_cat_mode = false;
+    s_pure_audio_stream = false;
     s_tune_on = false;
     s_tune_waiting_for_marker = false;
     s_tx_active = false;
