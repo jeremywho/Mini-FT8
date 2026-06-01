@@ -28,11 +28,15 @@ static esp_err_t trusdx_on_audio_start(void)
 
 static esp_err_t trusdx_sync_frequency_mode(int freq_hz)
 {
-    // Keep the radio in normal USB receive before syncing mode/frequency.
-    esp_err_t err = trusdx_send_cmd("RX;", 500);
-    if (err != ESP_OK) return err;
+    // RX; suppresses the UA1 audio stream on R2.00x firmware. While the streaming
+    // backend is active (post-connect band/status sync), skip RX; so we do not
+    // knock the stream offline; only send it when not streaming (legacy/idle path).
+    if (!trusdx_serial_streaming_mode_active()) {
+        esp_err_t rx_err = trusdx_send_cmd("RX;", 500);
+        if (rx_err != ESP_OK) return rx_err;
+    }
 
-    err = trusdx_send_cmd("MD2;", 500);
+    esp_err_t err = trusdx_send_cmd("MD2;", 500);
     if (err != ESP_OK) return err;
 
     char fa[32];

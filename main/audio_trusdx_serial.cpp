@@ -44,6 +44,11 @@ enum class TrusdxStreamState {
 
 struct TrusdxParser {
     TrusdxStreamState state = TrusdxStreamState::Audio;
+    // UA1 streams raw 8-bit audio with no ;CAT; framing, so the ';' state machine
+    // must be bypassed. Lives in the parser (not a global) so it is reset by
+    // reset_parser() on every connect and is written before the stream task that
+    // reads it is created (task creation acts as the cross-core memory barrier).
+    bool pure_audio = false;
     char token[48] = {};
     int token_len = 0;
     bool have_sample = false;
@@ -67,7 +72,6 @@ static TaskHandle_t s_tx_task_handle = nullptr;
 static volatile bool s_started = false;
 static volatile bool s_streaming = false;
 static volatile bool s_streaming_cat_mode = false;
-static volatile bool s_pure_audio_stream = false;  // UA1 = raw 8-bit audio, no ;CAT; framing
 static volatile bool s_stop_requested = false;
 static volatile bool s_connected = false;
 static volatile bool s_tune_on = false;
@@ -389,7 +393,7 @@ static bool parser_feed_byte(TrusdxParser* p, uint8_t b, float* out, int* out_co
 {
     if (!p) return false;
 
-    if (s_pure_audio_stream) {
+    if (p->pure_audio) {
         // UA1 streams raw 8-bit audio with no ;CAT; framing, so a byte equal to
         // 59 (';') is just an audio sample, not a delimiter. Treat all bytes as audio.
         p->audio_since_log++;
@@ -568,8 +572,7 @@ bool trusdx_serial_start(void)
     s_tx_done = false;
     s_tx_failed = false;
     s_tx_cancel_requested = false;
-    s_pure_audio_stream = false;
-    reset_parser();
+    reset_parser();  // clears s_parser.pure_audio
     ft8_audio_pipeline_clear_latest_waterfall_row();
 
     ESP_LOGI(TAG, "connect start");
@@ -673,8 +676,9 @@ bool trusdx_serial_start(void)
 
     ESP_LOGI(TAG, "streaming mode enabled");
     s_streaming_cat_mode = true;
-    s_pure_audio_stream = true;  // UA1 stream is raw audio; parser must not treat 59 as ';'
     reset_parser();
+    s_parser.pure_audio = true;  // UA1 stream is raw audio; set AFTER reset, BEFORE the
+                                 // stream task is created (task create = memory barrier)
 
     BaseType_t ret = xTaskCreatePinnedToCore(stream_task, "trusdx_rx",
                                              8192, nullptr, 4,
@@ -713,7 +717,6 @@ void trusdx_serial_stop(void)
     s_streaming = false;
     s_connected = false;
     s_streaming_cat_mode = false;
-    s_pure_audio_stream = false;
     s_tune_on = false;
     s_tune_waiting_for_marker = false;
     s_tx_active = false;

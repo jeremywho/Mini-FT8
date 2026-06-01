@@ -15,8 +15,24 @@
 namespace {
 
 constexpr uart_port_t kGpsUartNum = UART_NUM_1;
+// GPS UART pins. uart_set_pin() takes (TX, RX) from the ESP's perspective:
+// kGpsTxPin = ESP transmits -> module's GPS-RX; kGpsRxPin = ESP receives <- module's GPS-TX.
+//
+// Default targets the LoRa+GPS Cap for Cardputer ADV (SX1262 + ATGM336H/AT6668),
+// whose GPS UART is on G13/G15 per M5 docs: module GPS-TX=G15, GPS-RX=G13, 115200 baud.
+// So the ESP must RECEIVE on G15 and TRANSMIT on G13. These pins are free on the ADV
+// (old keyboard-scan pins; the ADV uses an I2C keypad). The truSDX uses native USB
+// (GPIO19/20), so GPS + radio coexist.
+//
+// Build with -DGPS_ON_PORTA to instead use the Grove PortA pins (G1/G2) for a
+// PortA GPS unit (ESP RX=G1, TX=G2).
+#ifdef GPS_ON_PORTA
 constexpr gpio_num_t kGpsTxPin = GPIO_NUM_2;
 constexpr gpio_num_t kGpsRxPin = GPIO_NUM_1;
+#else
+constexpr gpio_num_t kGpsTxPin = GPIO_NUM_13;  // ESP TX -> Cap GPS-RX
+constexpr gpio_num_t kGpsRxPin = GPIO_NUM_15;  // ESP RX <- Cap GPS-TX
+#endif
 constexpr int kGpsBaudFast = 115200;
 constexpr int kGpsBaudSlow = 9600;
 constexpr size_t kGpsLineMax = 128;

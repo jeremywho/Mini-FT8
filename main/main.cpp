@@ -4312,21 +4312,25 @@ static void draw_status_view() {
   BeaconMode disp_beacon = (ui_mode == UIMode::STATUS) ? g_status_beacon_temp : g_beacon;
   lines[0] = std::string("Beacon: ") + beacon_name(disp_beacon);
   lines[1] = status_sync_line();
-  {
-    // DIAG: while streaming, show the truSDX resampler rates ("truSDX <in>-><out>")
-    // here so we can read the actually-compiled output rate on-screen.
+  // DIAG (truSDX bring-up only): while the truSDX is actively streaming, replace the
+  // Band/Tune lines with the resampler rate + live RX byte/sample counter. Gated on
+  // truSDX + streaming so QMX/KH1 (whose debug-line getters return their own stale
+  // fmt=.../rd=.../KH1-MIC strings) keep their normal Band/Tune display.
+  const bool trusdx_diag =
+      canonical_radio_type(g_radio) == RadioType::TRUSDX && audio_source_is_streaming();
+  if (trusdx_diag) {
     const char* rxinfo = audio_source_get_debug_line1();
     lines[2] = (rxinfo && rxinfo[0])
                ? std::string(rxinfo)
                : (std::string("Band: ") + std::string(g_bands[g_band_sel].name) + " " +
                   std::to_string(g_bands[g_band_sel].freq));
-  }
-  {
-    // While a radio is streaming, show the live RX byte/sample counter here so
-    // we can see on-screen whether audio is actually arriving and resampling.
     const char* rxdbg = audio_source_get_debug_line2();
     lines[3] = (rxdbg && rxdbg[0]) ? (std::string("RX ") + rxdbg)
                                    : (std::string("Tune: ") + (g_tune ? "ON" : "OFF"));
+  } else {
+    lines[2] = std::string("Band: ") + std::string(g_bands[g_band_sel].name) + " " +
+               std::to_string(g_bands[g_band_sel].freq);
+    lines[3] = std::string("Tune: ") + (g_tune ? "ON" : "OFF");
   }
   if (status_edit_idx == 4 && !status_edit_buffer.empty()) {
     lines[4] = std::string("Date: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
@@ -5866,8 +5870,17 @@ void save_station_data() {
   core_fire_config_changed();
 }
 
+// Band index captured when STATUS is entered, so STATUS-exit can re-sync the
+// radio ONLY if the band actually changed. Setting the clock/date must not poke
+// the rig: on a streaming truSDX a mid-stream MD2;/FA; can disturb the UA1 audio
+// stream (and it relay-clicks needlessly on any radio).
+static int g_status_enter_band_sel = -1;
+
 static void enter_mode(UIMode new_mode) {
   // No special handling needed when leaving TX mode - autoseq manages queue internally
+  if (new_mode == UIMode::STATUS && ui_mode != UIMode::STATUS) {
+    g_status_enter_band_sel = g_band_sel;
+  }
   if (ui_mode == UIMode::STATUS && new_mode != UIMode::STATUS) {
     if (g_beacon != g_status_beacon_temp) {
       bool was_off = (g_beacon == BeaconMode::OFF);
@@ -5890,13 +5903,15 @@ static void enter_mode(UIMode new_mode) {
     status_edit_idx = -1;
     status_edit_buffer.clear();
 
-    // Auto-sync VFO + RX mode on STATUS exit. Picks up any in-STATUS
-    // changes (band advance via S->3, etc.) without needing a manual
-    // "Sync to QMX" button press. Idempotent — safe even if the same
-    // sync already fired (e.g. from S->3 in-menu push, or from the
-    // initial-connect path for QMX). For KH1 this is the primary sync
-    // path (UART CAT has no discrete "first connect" event).
-    sync_radio_to_current_band("STATUS exit");
+    // Auto-sync VFO + RX mode on STATUS exit, but ONLY if the band changed
+    // while in STATUS (e.g. band advance via S->3). Re-syncing unconditionally
+    // re-tuned the rig on every STATUS visit — including clock/date edits —
+    // which relay-clicks and, on a streaming truSDX, pokes MD2;/FA; into the
+    // live UA1 audio stream and can disturb it. A pure clock edit leaves the
+    // band untouched, so we skip the sync entirely.
+    if (g_band_sel != g_status_enter_band_sel) {
+      sync_radio_to_current_band("STATUS exit (band changed)");
+    }
   }
   if (new_mode != UIMode::QSO) {
     g_ble_qso_pick_mode = false;
