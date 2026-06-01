@@ -41,7 +41,10 @@ decode + waterfall.
   Decoded real 20 m FT8 (`CQ KF8BRC EM98`, `V31ZA W6GOK`).
 - **Cardputer**: connects over USB host, CAT works (band change retunes the rig), `UA1` streams
   ~7800 B/s, parser + resampler produce ~6000 samples/s of clean audio, waterfall renders,
-  and FT8 **decodes** with an accurate clock.
+  and FT8 **decodes**.
+- **GPS auto-time WORKING** (M5 LoRa+GPS Cap, ATGM336H). GPS UART on **G13/G15** (set in
+  `gps.cpp`; `-DGPS_ON_PORTA` for a PortA unit). Gets a fix → sets UTC automatically → decodes
+  with no manual clock entry. Press `G` for the GPS screen. Coexists with the truSDX.
 
 ### On-screen diagnostics (currently in the STATUS screen — temporary)
 While streaming, the STATUS screen (`S`) shows live instrumentation in place of the normal
@@ -55,16 +58,17 @@ Band/Tune lines:
 
 ## Known limitations / next steps
 
-- **Decodes are sparse** (one slot hits, the next is blank). The on-screen decode list is
-  **rebuilt every 15 s slot** (`main.cpp`: `s_dec_count = 0` → fill → `ui_set_rx_list_static`),
-  so a decode shows for one slot then clears if the next slot decodes nothing. Cause is marginal
-  decoding: tighten the **clock** (biggest lever) and/or improve antenna. The **GPS module**
-  (PORTA, in transit) will make the clock exact and automatic → expect consistent decodes.
-- **Diagnostic display is still active** — the STATUS Band/Tune lines are replaced by the
-  rate/counter readouts. Decide whether to keep a tidy counter or restore the normal STATUS UI
-  before this is "done."
-- **Optional UX:** decode list clears each slot. If desired, change it to *accumulate* decodes
-  across slots (WSJT-X style) — small change in `main.cpp` around `ui_set_rx_list_static`.
+- **Flaky first connect** (open): the first `S`→`2` after a truSDX power-cycle sometimes comes
+  up with `raw` stuck near 0 (~6 B/s); reconnecting once gets the full ~7800 B/s. Pre-existing,
+  not caused by the recent fixes. Likely needs a settle delay or auto-retry in the connect.
+- **Decode list rebuilds every 15 s slot** (`main.cpp`: `s_dec_count = 0` → fill →
+  `ui_set_rx_list_static`), so a decode shows for one slot then clears if the next slot decodes
+  nothing. With GPS time + a decent antenna this is far less noticeable. Optional polish: make
+  the list *accumulate* across slots (WSJT-X style).
+- **Diagnostic display still active (intentional, gated):** while the truSDX streams, the STATUS
+  Band/Tune lines show the rate + `RX r/a/o` counter. Gated on `TRUSDX && streaming`, so QMX/KH1
+  are unaffected. Kept as a stream-health indicator while the flaky-connect issue is open;
+  restore Band/Tune later if you want a clean production UI.
 - **TX is not done** — this branch focused on RX. TX synth exists (`ft8_tx_synth`,
   `trusdx_serial_begin_ft8_tx`) but is unverified on-air.
 
@@ -74,9 +78,13 @@ Band/Tune lines:
 
 | File | Change |
 |---|---|
-| `main/audio_trusdx_serial.cpp` | connect sends `UA1;` (not `UA2;`); removed `RX;` from connect; added `s_pure_audio_stream` + pure-audio branch in `parser_feed_byte`; counter line now `r/a/o` |
-| `main/main.cpp` | STATUS screen shows truSDX rate (`draw_status_view` Band line) + RX `r/a/o` counter (Tune line) while streaming |
+| `main/audio_trusdx_serial.cpp` | connect sends `UA1;` (not `UA2;`); removed `RX;` from connect; pure-audio parse via `TrusdxParser.pure_audio` (was a cross-core volatile global); counter line `r/a/o` |
+| `main/radio_trusdx.cpp` | `sync_frequency_mode` skips `RX;` while streaming (RX; suppresses the UA1 stream) |
+| `main/gps.cpp` | GPS UART on **G13/G15** for the M5 LoRa+GPS Cap (default); `-DGPS_ON_PORTA` for a Grove PortA unit |
+| `main/main.cpp` | STATUS diagnostic gated on `TRUSDX && streaming`; STATUS-exit re-sync only when the band changed (clock edits no longer poke the rig) |
 | `.gitignore` | ignore `main/wifi_debug.*` (abandoned, kept on disk) and `build_*.log` |
+
+Commits: `65cb66a` (working RX decode), `186a019` (GPS time + review fixes + stop mid-stream re-tune).
 
 ---
 

@@ -93,9 +93,19 @@ This sequence streams reliably and has decoded real off-air FT8.
      force-refresh (the redraw is laggy). **Healthy: `raw`≈7800/s, `out`≈6000/s.**
 6. The main RX/waterfall screen should show a **dark field with discrete vertical traces**
    (not a solid block). Decodes appear at the FT8 boundaries (:00 / :15 / :30 / :45).
-7. **Clock:** FT8 needs UTC within ~2 s. Set manually on STATUS: `5` = Date (YYYY-MM-DD),
-   `6` = Time (HH:MM:SS); type digits in place, `,`/`/` move, **Enter commits**, backtick
-   cancels (release the last digit before Enter). Normal source = GPS on PORTA.
+7. **Clock:** FT8 needs UTC within ~2 s. Best source = **GPS** (auto-sets the clock).
+   Press **`G`** for the GPS screen (sat count, fix, time, grid). Manual fallback on STATUS:
+   `5` = Date (YYYY-MM-DD), `6` = Time (HH:MM:SS); digits in place, `,`/`/` move,
+   **Enter commits**, backtick cancels (release the last digit before Enter).
+
+### GPS module wiring (pins differ by module — set in `gps.cpp`)
+- **Default build = M5 LoRa+GPS Cap** (Cardputer ADV, ATGM336H GPS): GPS UART on **G13/G15**
+  (ESP RX = G15 ← module GPS-TX; ESP TX = G13 → module GPS-RX). These pins are free on the
+  ADV (it uses an I2C keypad). Coexists with the truSDX (native USB, GPIO19/20). CONFIRMED
+  WORKING: GPS fix → auto UTC → FT8 decodes, no manual clock.
+- **`-DGPS_ON_PORTA` build = Grove PortA GPS unit** on G1/G2.
+- Baud is auto-probed (9600/115200), so only the pins matter. If a known-good GPS shows
+  0 sats, suspect RX/TX swapped → swap `kGpsTxPin`/`kGpsRxPin` in `gps.cpp`.
 
 ---
 
