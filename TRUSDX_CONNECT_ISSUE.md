@@ -1,26 +1,32 @@
 # truSDX Connect Issue — device attached at boot won't enumerate
 
-**Status:** OPEN — root cause understood (a `NEW_DEV` enumeration race); the most principled
-fix (root-port power sequencing) was tried on hardware and **failed**; one untried idea remains
-(`usb_host_device_addr_list_fill()`); a 100%-reliable workaround exists (hot-plug, case 3).
-**Last updated:** 2026-06-01
+**Status:** OPEN — but the boot-trace (2026-06-01) **changed the diagnosis**. The real problem
+is **RECONNECT**, not boot-with-cable: the *first* connect of a boot works (even cable-attached);
+every subsequent connect (after a teardown via `S → 2`) fails. We have peeled back three layers
+with on-device logging — host-reuse fixed, address-adopt fixed — and are now stuck at the device
+**open/probe failing on a reused host** (driver lands in Error `st=6`). Reliable workaround:
+power-cycle the Cardputer (not just the radio) to get a clean first connect.
+**Last updated:** 2026-06-01 (boot-trace findings added)
 **Scope:** truSDX RX over USB host on the M5 Cardputer ADV (`trusdx-rx` branch). Affects
 the USB-host connect path only — decode, GPS, resampling all work once connected.
 
 ---
 
-## TL;DR
+## TL;DR (updated after boot-trace)
 
-If the **truSDX is already plugged in when the Cardputer boots**, the connect fails and
-`S → 2` does nothing. The cause is an **ESP-IDF USB-host enumeration race**: the driver only
-opens a device in response to a `USB_HOST_CLIENT_EVENT_NEW_DEV` event, and that event is
-**unreliably delivered (often lost)** for a device already attached when the host installs —
-the daemon can enumerate and fire `NEW_DEV` before our client is registered to receive it.
-Nothing in the code path opens a present-but-never-announced device.
+The original theory below ("device attached at boot won't enumerate") was **only partly right**
+and is **superseded** by the boot-trace evidence. What the on-device log actually shows:
 
-**Reliable workaround:** boot the Cardputer **with the cable unplugged**, let it come up,
-**then plug in the truSDX**, then `S → 2`. The physical plug-in is a clean connect transition
-that reliably fires the event the whole open path depends on.
+- **The first connect of a boot SUCCEEDS** — including cable-attached-at-boot. `a1 READY
+  vid=1a86 pid=7523`, audio flows. So boot-with-cable is NOT the core failure.
+- **Every RECONNECT fails.** Once anything tears the connection down (`S → 2` while connected
+  calls `audio_source_stop()` → `s_ch340.end()`), bringing it back up fails — and historically
+  only a Cardputer power-cycle recovered. This is a **USB teardown/re-init** bug, not enumeration.
+- We fixed two layers of it with evidence (host reuse, address adopt). The remaining failure is
+  the device **open/probe** on a reused host. See "Boot-trace findings" below for the full chain.
+
+**Reliable workaround:** power-cycle the **Cardputer** to force a clean first connect (the
+first connect always works). Avoid `S → 2` reconnects until the open-on-reuse layer is fixed.
 
 ---
 
@@ -39,6 +45,69 @@ Diagnostic readout in the dead state (from the on-screen `st bi tot` / `r a o` H
 
 The deciding variable is **USB enumeration order**: the truSDX must appear *after* the
 Cardputer's USB host is running.
+
+---
+
+## Boot-trace findings (2026-06-01) — the real diagnosis
+
+To stop debugging blind, we added an on-device boot/connect trace (`main/boot_trace.{h,cpp}`):
+a bounded ring buffer written to `/storage/bootlog.txt`, every line prefixed `BTLOG|`. It is
+pulled back **without an SD card or serial console** by reading the SPIFFS partition over the
+download-mode USB connection:
+```
+esptool --chip esp32s3 -p COM8 -b 921600 read_flash 0x600000 0x200000 spiffs_dump.bin
+strings -n 8 spiffs_dump.bin | grep "BTLOG|"
+```
+The trace logs, per connect attempt: `begin=` result, driver state (`st`, 5=Ready/6=Error),
+`known=` (count from `usb_host_device_addr_list_fill()`, i.e. devices the stack sees regardless
+of events), `newdev=` (did NEW_DEV fire / `device_connected_`), CAT result, and
+`tot=`/`flowing=` (bytes received / audio actually flowing).
+
+### What the trace proved
+1. **First connect of a boot works, even cable-attached:**
+   `a1 begin=ESP_OK st=1` → `a1 READY vid=1a86 pid=7523` → `connected OK tot=1807 (flowing=1)`.
+   This **disproved the original "boot-with-cable never enumerates" headline.** Boot-with-cable
+   is fine; the failures are all on reconnect.
+2. **Reconnect originally wedged hard:** every reconnect attempt showed
+   `a1 begin=ESP_ERR_INVALID_STATE st=6`. Root cause: `end()`'s `usb_host_uninstall()` was
+   failing (it stops the daemon before device-free/uninstall finishes, so uninstall has
+   "unfinished actions") yet the code cleared its installed-flag anyway → next
+   `usb_host_install()` returned `INVALID_STATE` → Error. **FIXED** (see attempts #6/#7).
+3. **`flowing=0` on some "successful" connects:** e.g. `connected OK tot=64 (flowing=0)` — the
+   connect succeeds and CAT replies (`ID020;`), but `UA1;` doesn't start audio and only ~64
+   bytes arrive. This is **Bug B** (DTR-reset eats `UA1;`), distinct from the reconnect bug.
+
+### Layer-by-layer progress on the reconnect bug (each fix verified by the next trace)
+| Fix | Trace before | Trace after | Verdict |
+|-----|--------------|-------------|---------|
+| **#6 `end()` pumps events + only clears flag on real uninstall success** | `begin=INVALID_STATE st=6` | still `INVALID_STATE` | Necessary but insufficient — flag lived in `impl_`, which `Ch340UsbSerial::end()` **deletes** (`delete impl_`), so it didn't survive the stop/start |
+| **#7 move install-state to a process-scope static `g_idf_host_installed`** (survives `delete impl_`); `begin()` reuses an already-installed host | `begin=INVALID_STATE st=6` | `begin=ESP_OK`, `known=1` | **FIXED the wedge.** Reconnect's `begin` now succeeds and the stack reports the device present (`known=1`) — but `newdev=0`, so the device was never opened → TIMEOUT |
+| **#8 adopt-from-address-list** in `poll()`: if no NEW_DEV but `addr_list_fill` returns a device, adopt `addrs[0]` and run `openAndProbeDevice()` | `known=1 newdev=0` (never opened) | `newdev=1` then `st=6` (Error) | **Adopt fires** (sets device_connected_ → newdev=1) but the **device open/probe FAILS on the reused host** → driver goes to Error. This is the current wall. |
+
+### Current wall (where it's stuck now)
+Reconnect trace, latest build:
+```
+79792  connect start
+79799  a1 begin=ESP_OK st=1                 ← host reuse OK (#7)
+80301  a1 after500: st=1 known=1 newdev=0   ← stack sees device, not yet adopted
+82810  a1 TIMEOUT st=6 known=1 newdev=1      ← adopt fired (newdev=1), but open/probe failed -> st=6 Error
+```
+So the chain is now: **reuse host ✓ → see device ✓ → adopt address ✓ → `usb_host_device_open()`
+(or the descriptor read / interface claim that follows) FAILS on a device that was previously
+opened on this host and not cleanly released.** The likely cause is that the prior connection's
+device handle / interface claim was not fully torn down (the same incomplete-teardown family as
+#6), so re-opening the same address errors. Next probe: log the exact failing call inside
+`openAndProbeDevice()` (open vs get_descriptor vs claimInterface) and whether
+`usb_host_device_free_all()` actually freed the handle on the prior `end()`.
+
+### Honest assessment
+Each layer we fix exposes the next, all in the **teardown/re-init** family — the ESP-IDF USB
+host does not cleanly support tear-down-and-reconnect-in-place within one boot for this driver.
+The first connect per boot is reliable. A pragmatic option is to **stop trying to reconnect
+in-place** and instead, on `S → 2`, do the one thing that always works: trigger a full restart
+of the connect from a clean host (or document "power-cycle the Cardputer to reconnect"). The
+"correct" fix is to make `end()` fully release the device handle + interface so a re-open
+succeeds — which needs the per-call logging described above to pinpoint.
 
 ---
 
@@ -172,9 +241,38 @@ boot-with-cable case.
    regress the working hot-plug path: the port ends up powered, so plugging in afterward still
    produces a real edge → `NEW_DEV` → opens.
 
----
+   **POSTSCRIPT (boot-trace):** the boot-trace later showed the first connect works fine anyway,
+   so root-port sequencing was solving a problem that mostly wasn't there. The real bug is
+   reconnect (#6–#8). Left in the build; harmless.
 
-## On-screen diagnostics (useful, keep)
+6. **`end()`: pump events to completion + only clear installed-flag on real uninstall success**
+   (`ch340_usb_serial.cpp`). The teardown stopped the USB daemon task, then called
+   `usb_host_device_free_all()` / `usb_host_uninstall()` — but those finish asynchronously and
+   need `usb_host_lib_handle_events()` pumped (which only the daemon did). So uninstall failed
+   with "unfinished actions," yet the code cleared its installed-flag anyway → next
+   `usb_host_install()` → `INVALID_STATE` → wedge. Fix: pump events until `ALL_FREE` ourselves
+   after stopping the daemon, and only clear the flag if uninstall returned `ESP_OK`.
+   **Result: insufficient alone** — the flag lived in the per-`Impl` object, and
+   `Ch340UsbSerial::end()` does `delete impl_`, so the flag didn't survive to the next
+   `begin()`. Trace still showed `begin=INVALID_STATE st=6`.
+
+7. **Move install-state to a process-scope static `g_idf_host_installed`** + `begin()` reuses an
+   already-installed host (`ch340_usb_serial.cpp`). Because `delete impl_` destroys any member
+   flag, the "is the IDF host installed" truth must live at process scope to survive a
+   stop/start. `begin()` now skips `usb_host_install()` when `g_idf_host_installed` is true and
+   reuses the host (resetting `device_connected_`/`dev_addr_`).
+   **Result: FIXED THE WEDGE.** Trace flipped from `begin=INVALID_STATE st=6` to `begin=ESP_OK`
+   **and `known=1`** (stack now reports the device present on the reused host). But `newdev=0`
+   → device never opened → TIMEOUT. Exposed the next layer.
+
+8. **Adopt-from-address-list in `poll()`** (`ch340_usb_serial.cpp`). Since a reused host doesn't
+   fire a fresh `NEW_DEV` but `usb_host_device_addr_list_fill()` reports the device (`known=1`),
+   adopt `addrs[0]` as `dev_addr_`, set `device_connected_`, and let the existing
+   `openAndProbeDevice()` run — no event needed.
+   **Result: adopt fires, but open/probe FAILS.** Trace now shows `newdev=1` (adopt set the
+   flag) then `st=6` (Error) — `usb_host_device_open()` or the descriptor/claim that follows
+   fails on a device previously opened on this host and not cleanly released. **This is the
+   current wall** (see "Boot-trace findings → Current wall" above).
 
 While streaming, the STATUS screen (`S`) shows (gated to truSDX + streaming):
 - **`st# bi# tot#`** — CH340 driver state (`5`=Ready), last bulk-IN status (`0`=OK),
@@ -186,25 +284,39 @@ and "Connect to truSDX" proved the device never opened at all).
 
 ---
 
-## Candidate real fixes
+## Candidate real fixes (updated after boot-trace)
 
-1. **Poll for already-present devices via `usb_host_device_addr_list_fill()` — THE REMAINING
-   UNTRIED IDEA, and the most promising.** Confirmed present in this repo's IDF 5.4 headers
-   (`components/usb/include/usb/usb_host.h:381`). This is **event-independent** — it does not
-   rely on `NEW_DEV` at all, which is exactly why it could beat both the race (#5) and the
-   logical-power dead end. Approach: in `poll()`, when `!device_connected_ && dev_hdl_ ==
-   nullptr`, call `usb_host_device_addr_list_fill()`; if it returns ≥1 address, adopt
-   `list[0]` as `dev_addr_`, set `device_connected_ = true`, and let the existing
-   `openAndProbeDevice()` path run. Instead of *waiting* for the device to announce itself, we
-   actively *scan* for the device that is already there.
-   **Risk / chicken-and-egg:** if the device is absent from the stack's list precisely
-   *because* it was never enumerated (no edge → never added), the scan returns empty too. So
-   this might also fail. It is the best remaining shot but is **not** a sure thing, and it is
-   still a blind iteration (see meta-blocker below).
+The bug is now isolated to **device open/probe failing on a reused host** (attempt #8 wall).
+Both candidates below target that, with the next concrete diagnostic step first.
 
-2. **Accept the hot-plug workflow (case 3)** as the supported procedure and document it. The
-   device is 100% reliable when booted unplugged then connected. This is the current
-   recommendation.
+1. **NEXT PROBE — log exactly which call fails in `openAndProbeDevice()`.** We know adopt fires
+   and then the driver hits Error (`st=6`). Add boot-trace lines inside `openAndProbeDevice()`
+   for: `usb_host_device_open()` result, `usb_host_get_device_descriptor()` result, and
+   `claimInterface()` result. Also log whether the prior `end()`'s `usb_host_device_free_all()`
+   actually freed the handle (vs. still-referenced). This pinpoints whether the re-open fails
+   because (a) the address is stale, (b) the device is still open/claimed from the prior
+   connection, or (c) a descriptor/claim step errors. One flash, then pull the trace.
+
+2. **Fully release the device on `end()` so re-open succeeds.** Likely fix once the probe above
+   identifies the failing call: ensure `closeDevice(true)` + `usb_host_device_free_all()` truly
+   release the handle/interface before `end()` returns, OR if the address is stale after a
+   partial free, force a real re-enumeration. The recurring theme across #6/#7/#8 is
+   **incomplete teardown** — the device handle/interface from the first connection isn't fully
+   released, so anything that tries to re-open the same address fails.
+
+3. **Pragmatic fallback — don't reconnect in-place.** The first connect per boot is reliable.
+   Make `S → 2` (or a dead-stream detection) do a **full controlled restart** of the connect
+   path from a guaranteed-clean state, or simply document "power-cycle the Cardputer to
+   reconnect." Lower-effort, ships today, sidesteps the ESP-IDF teardown limitation.
+
+### Tried and ruled out
+- **Address-adopt alone (attempt #8)** — adopt works but open/probe fails on the reused host
+  (the new wall, not a dead end — it advanced us one layer).
+- **Root-port power sequencing (attempt #5)** — logical port power doesn't create the
+  electrical edge the S3 root-port PHY needs; and the boot-trace showed first-connect works
+  anyway, so it was solving a non-problem. Failed on hardware.
+- **Host uninstall/reinstall retry (attempt #3)** — reinstalling doesn't re-scan an
+  already-attached device.
 
 ### Tried and ruled out
 - **Root-port power sequencing (attempt #5 above)** — logical port power doesn't create the
