@@ -4312,26 +4312,9 @@ static void draw_status_view() {
   BeaconMode disp_beacon = (ui_mode == UIMode::STATUS) ? g_status_beacon_temp : g_beacon;
   lines[0] = std::string("Beacon: ") + beacon_name(disp_beacon);
   lines[1] = status_sync_line();
-  // DIAG (truSDX bring-up only): while the truSDX is actively streaming, replace the
-  // Band/Tune lines with the resampler rate + live RX byte/sample counter. Gated on
-  // truSDX + streaming so QMX/KH1 (whose debug-line getters return their own stale
-  // fmt=.../rd=.../KH1-MIC strings) keep their normal Band/Tune display.
-  const bool trusdx_diag =
-      canonical_radio_type(g_radio) == RadioType::TRUSDX && audio_source_is_streaming();
-  if (trusdx_diag) {
-    const char* rxinfo = audio_source_get_debug_line1();
-    lines[2] = (rxinfo && rxinfo[0])
-               ? std::string(rxinfo)
-               : (std::string("Band: ") + std::string(g_bands[g_band_sel].name) + " " +
-                  std::to_string(g_bands[g_band_sel].freq));
-    const char* rxdbg = audio_source_get_debug_line2();
-    lines[3] = (rxdbg && rxdbg[0]) ? (std::string("RX ") + rxdbg)
-                                   : (std::string("Tune: ") + (g_tune ? "ON" : "OFF"));
-  } else {
-    lines[2] = std::string("Band: ") + std::string(g_bands[g_band_sel].name) + " " +
-               std::to_string(g_bands[g_band_sel].freq);
-    lines[3] = std::string("Tune: ") + (g_tune ? "ON" : "OFF");
-  }
+  lines[2] = std::string("Band: ") + std::string(g_bands[g_band_sel].name) + " " +
+             std::to_string(g_bands[g_band_sel].freq);
+  lines[3] = std::string("Tune: ") + (g_tune ? "ON" : "OFF");
   if (status_edit_idx == 4 && !status_edit_buffer.empty()) {
     lines[4] = std::string("Date: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
   } else {
@@ -7002,6 +6985,35 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           if (handle_kh1_diag_key(c)) { draw_status_view(); }
           else if (c == '1') { g_status_beacon_temp = (BeaconMode)(((int)g_status_beacon_temp + 1) % 3); draw_status_view(); }
           else if (c == '2') {
+            // S->2 = connect / sync. For the truSDX, only tear down when we are NOT
+            // already receiving audio. A press on a LIVE stream is a benign re-sync:
+            // begin_usb_host_mode() sees streaming, skips the audio start, and just
+            // re-pushes the current band's VFO/mode over CAT. The old code tore down
+            // unconditionally, which killed a healthy connection on the 2nd press.
+            //
+            // The teardown is still needed to clear stale boot-with-cable state, but
+            // the s_streaming flag alone is NOT a reliable "healthy" signal: a dead
+            // pipe (UA1; latched, no audio bytes) leaves streaming=true. So gate the
+            // skip on audio ACTUALLY FLOWING — sample the RX-byte counter across a
+            // short window. Flowing audio delivers ~1.5 KB/200 ms; a dead pipe stays
+            // ~flat, so it correctly falls through to the recovering teardown path.
+            // audio_source_stop() -> trusdx_serial_stop() self-guards, and the connect
+            // retries USB enumeration, so the teardown still recovers boot-with-cable.
+            if (canonical_radio_type(g_radio) == RadioType::TRUSDX) {
+              bool flowing = false;
+              if (audio_source_is_streaming() && radio_control_ready()) {
+                const uint32_t before = audio_source_total_rx_bytes();
+                vTaskDelay(pdMS_TO_TICKS(200));
+                flowing = (audio_source_total_rx_bytes() - before) > 256;  // ~flat => dead pipe
+              }
+              if (flowing) {
+                debug_log_line("truSDX re-sync");  // healthy: VFO re-push only, no teardown
+              } else {
+                debug_log_line("truSDX reconnect");
+                audio_source_stop();
+                vTaskDelay(pdMS_TO_TICKS(300));
+              }
+            }
             begin_usb_host_mode();
           }
           else if (c == '3') {
@@ -7009,13 +7021,20 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             save_station_data();
             draw_status_view();
             debug_log_line("Band changed");
-            // In-memory only. CAT push is deferred to:
+            // truSDX has no antenna relay, so retune the rig IMMEDIATELY — what you
+            // see on the band line is what the radio is tuned to. Mirrors the VFO
+            // push in begin_usb_host_mode(); only fires when CAT is up.
+            //
+            // Other radios stay deferred: the CAT push lands on
             //   - STATUS exit (enter_mode), or
-            //   - QMX initial-connect (consume_cdc_initial_sync reads
-            //     current g_band_sel at sync time, so band edits made
-            //     while QMX was still enumerating get picked up).
-            // Why deferred: KH1 band change engages a physical antenna
+            //   - QMX initial-connect (consume_cdc_initial_sync reads the current
+            //     g_band_sel at sync time, so edits made while QMX was still
+            //     enumerating get picked up).
+            // Why deferred for them: the KH1 band change engages a physical antenna
             // relay, and we don't want to click it on every S->3 press.
+            if (canonical_radio_type(g_radio) == RadioType::TRUSDX) {
+              sync_radio_to_current_band("truSDX band change");
+            }
           }
               else if (c == '4') {
                 if (is_trusdx_radio(g_radio)) {
