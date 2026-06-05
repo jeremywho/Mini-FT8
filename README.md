@@ -25,6 +25,13 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 # Mini-FT8 Operation Manual (V2.0.4)
 (Temporarily disabled BLE in V2.0.4, if you need it, please choose V2.0.4 in kh1_mic branch)
 
+> **`trusdx-rx` branch note:** this build also supports **(tr)uSDX RX** — decode FT8 from a
+> (tr)uSDX over a single USB-C cable — and builds with BLE **on** (`idf.py -DENABLE_BLE=ON build`).
+> Select the radio at **MENU P2 → `3`** (cycles `QMX` → `KH1-USBC` → `KH1-MIC` → `truSDX`). RX
+> works; known caveats are a flaky first connect and conditions-limited decode count (needs a
+> real antenna + open band). See `TRUSDX_RX_STATUS.md` (status), `CLAUDE.md` (build/flash/test),
+> and `TRUSDX_FACTS.md` (protocol + USB-host facts).
+
 ## Quick Mode Map
 
 | Key | Mode | Purpose |
@@ -106,7 +113,7 @@ Notes:
 |  | `6` | Enter Sleep. Shows battery info. |
 | `N` (MENU P2) | `1` | Select offset source: Random / RX / Fixed. Random values are within 500-2500 Hz. |
 |  | `2` | Edit fixed cursor offset (in place). Enter directly or use `▲` `▼` `◀` `▶`. |
-|  | `3` | Select radio (`QMX` / `KH1`). |
+|  | `3` | Select radio. This branch cycles `QMX` → `KH1-USBC` → `KH1-MIC` → `truSDX`. |
 |  | `4` | Edit ignore list (Long Edit). Prefixes are separated by spaces; maximum 64 characters. |
 |  | `5` | Edit comment (Long Edit). Used for ADIF logging. Supports `/Radio` and `/Grid` macro expansion. |
 |  | `6` | Turn BLE on/off. Device name is `Mini-FT8-<callsign>`. |

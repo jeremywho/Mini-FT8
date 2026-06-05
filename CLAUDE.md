@@ -19,20 +19,51 @@ This branch (`trusdx-rx`) = the fork's `design/trusdx-backend` (TX synth + newer
 
 ---
 
-## Build (ESP-IDF v5.4, installed at `C:\esp\esp-idf`)
+## Build — toolchain & how it's deployed
 
+**Yes, this is a standard ESP-IDF project** (CMake + `idf.py`). It is NOT Arduino/PlatformIO.
+
+| Thing | Value |
+|---|---|
+| Build system | ESP-IDF (`idf.py` → CMake → Ninja). Top-level `CMakeLists.txt` does `project(mini_ft8)` |
+| ESP-IDF version | **v5.4.x**, installed at `C:\esp\esp-idf` (the env has also shown 5.5.x; `sdkconfig`/`dependencies.lock` track whichever ran — see "IDF version churn" below) |
+| Target chip | **esp32s3** (`CONFIG_IDF_TARGET="esp32s3"`) — the Cardputer ADV's StampS3 |
+| Flash size | 8 MB (`CONFIG_ESPTOOLPY_FLASHSIZE="8MB"`) |
+| Partition table | `partitions.csv`: nvs(24K)@0x9000, phy(4K)@0xf000, **factory app 0x5F0000@0x10000**, **spiffs 2M@0x600000** |
+| Host OS | Windows; build from **PowerShell** |
+
+### Build commands
 ```powershell
-. C:\esp\esp-idf\export.ps1
-idf.py -DENABLE_BLE=ON build
+. C:\esp\esp-idf\export.ps1        # puts idf.py + xtensa toolchain on PATH (run once per shell)
+idf.py -DENABLE_BLE=ON build       # from the trusdx-rx worktree root
 ```
+`export.ps1` is the IDF environment script — it sets `IDF_PATH` and prepends the
+`xtensa-esp32s3-elf` GCC toolchain + the IDF python venv. Without sourcing it, `idf.py`
+isn't found. (Top-level CMake pulls IDF via `include($ENV{IDF_PATH}/tools/cmake/project.cmake)`.)
 
-- **Always pass `-DENABLE_BLE=ON`.** BLE-off is a different RAM layout; a `POST_BUILD`
-  DRAM budget check (`tools/check_dram_budget.py`, ~50 KB threshold) fails the build if
-  static DIRAM falls too low. (BLE-off was used only for the abandoned WiFi-debug build.)
+### Build outputs (in `build/`)
+- `mini_ft8.bin` — the app image (flashed at 0x10000).
+- `MiniFT8_Merged_Auto.bin` — a single merged image (bootloader+parts+app), auto-generated
+  by a `POST_BUILD` step in the top-level `CMakeLists.txt` (`esptool merge_bin`) for releases.
+
+### Feature flags (compile-time, default ON; override with `idf.py ... -D<FLAG>=OFF`)
+Defined in `main/feature_flags.h` (guarded `#ifndef`, default `1`):
+- **`ENABLE_BLE`** (default ON) — NimBLE controller + GATT UI. **Always build `-DENABLE_BLE=ON`**
+  for the truSDX/normal firmware. BLE-off is a different RAM layout and exists only for the
+  abandoned WiFi-debug experiment. A `POST_BUILD` DRAM budget check
+  (`tools/check_dram_budget.py`, ~50 KB threshold) FAILS the build if static DIRAM is too low.
+- **`ENABLE_FT4`** (default ON) — FT4 protocol + Mode menu item.
+- **`GPS_ON_PORTA`** (default OFF) — see GPS wiring below; default targets the LoRa+GPS Cap (G13/G15).
+
+### Gotchas
 - If the build dir gets confused (after toggling `-D` flags, or a killed/half build):
-  `idf.py fullclean` first, then build. A clean build is ~5–10 min; incremental is ~1–2 min.
-- **Never run two `idf.py build` in the same directory at once** — ninja collides and both
-  fail (and a failed `fullclean` build leaves no app binary).
+  `idf.py fullclean` first, then build. Clean build ~5–10 min; incremental ~1–2 min.
+- **Never run two `idf.py build` in the same directory at once** — Ninja collides and both
+  fail (a failed `fullclean` build can leave no app binary; just rebuild).
+- **IDF version churn:** building under IDF 5.5.x then 5.4.x (or vice-versa) rewrites
+  `sdkconfig` + `dependencies.lock` (~500 lines of `CONFIG_SOC_*` diff). That churn is a
+  byproduct of the IDF version, not real changes — revert those two files
+  (`git checkout -- sdkconfig dependencies.lock`) before committing unless you intend the bump.
 
 ---
 
@@ -75,7 +106,10 @@ What it does (this is the template the Cardputer connect must match):
 - Captures 15 s of raw 8-bit audio (~7820 B/s), resamples 7820→12000 Hz (`raw_to_wav.py`),
   decodes with **Ft8DotNet** (`C:\Data\Repos\ft8-may-2026`, .NET 10).
 
-This sequence streams reliably and has decoded real off-air FT8.
+This sequence streams reliably and has decoded real off-air FT8. **Use it to sanity-check
+conditions:** if Ft8DotNet pulls nothing off a captured slot, the Cardputer won't either —
+sparse/zero decodes indoors are conditions, not a firmware fault (confirmed 2026-06-04 with
+`C:\Users\jerem\trusdx_capture.py` → Ft8DotNet: 0 real decodes off the same antenna).
 
 ---
 
@@ -87,12 +121,14 @@ This sequence streams reliably and has decoded real off-air FT8.
 3. STATUS screen (`S`) → press **`2`** to connect/sync.
 4. **Watch the truSDX's own OLED**: it must stay normal. Vertical-line garbage = its firmware
    crashed → power-cycle it (see `UA2` gotcha below).
-5. On the Cardputer STATUS screen, diagnostic readouts (added for bring-up):
-   - **Band line** → `truSDX 7825->6000` = the resampler in→out rates (expected healthy values).
-   - **Counter line** → `RX r<raw> a<audio> o<out>`, updated ~1/s. Toggle `S` off/on to
-     force-refresh (the redraw is laggy). **Healthy: `raw`≈7800/s, `out`≈6000/s.**
+5. The STATUS screen shows normal **Band / Tune** lines. (The bring-up `truSDX 7825->6000` /
+   `RX r<raw> a<audio> o<out>` diagnostic overlay was removed 2026-06-04 — there's no on-screen
+   byte counter anymore; gauge stream health from the waterfall.)
 6. The main RX/waterfall screen should show a **dark field with discrete vertical traces**
-   (not a solid block). Decodes appear at the FT8 boundaries (:00 / :15 / :30 / :45).
+   (not a solid block). Decodes appear at the FT8 boundaries (:00 / :15 / :30 / :45) **when
+   there's a decodable signal.** Indoors on a dead band you may see ≤1/slot or none — that's
+   **conditions, not a fault** (a PC reference decoder pulls nothing off the same antenna; see
+   `TRUSDX_RX_STATUS.md` "Update 2026-06-04").
 7. **Clock:** FT8 needs UTC within ~2 s. Best source = **GPS** (auto-sets the clock).
    Press **`G`** for the GPS screen (sat count, fix, time, grid). Manual fallback on STATUS:
    `5` = Date (YYYY-MM-DD), `6` = Time (HH:MM:SS); digits in place, `,`/`/` move,
@@ -115,7 +151,7 @@ This sequence streams reliably and has decoded real off-air FT8.
 |---|---|
 | `main/audio_trusdx_serial.cpp` | truSDX RX driver: connect sequence, CAT (write-only), byte→audio parser + resampler (7825→6000), `r/a/o` counters |
 | `main/radio_trusdx.cpp` | truSDX CAT/control wrapper |
-| `components/ch340_usb_serial/` | CH340 USB-host driver |
+| `components/ch340_usb_serial/` | CH340 USB-host driver — wraps the maintained `cdc_acm_host` + `ch34x_vcp_open` C API (since the 2026-06 migration); exposes `droppedRxBytes()` |
 | `main/ft8_audio_pipeline.cpp` | shared FT8 monitor/decode pipeline (6000 Hz) |
 | `main/main.cpp` | UI, `RadioType::TRUSDX`, STATUS screen (`draw_status_view`), connect (`begin_usb_host_mode`) |
 | `main/audio_source.cpp` | source router (`AUDIO_SOURCE_TRUSDX_SERIAL`), debug-line getters |
@@ -137,9 +173,12 @@ This sequence streams reliably and has decoded real off-air FT8.
 - The connect must **not** send `RX;` before the `UA` command — `RX;` suppresses the stream.
   Working order: `ID` / `PS` / `FA` / `IF` / `MD2` / `UA1`.
 - `send_cat` / `send_cat_locked` are **write-only** (they do not wait for an ACK).
-- `UA1` is raw audio → the parser must run in **pure-audio mode** (every byte is a sample;
-  a byte equal to 59 / `';'` is audio, not a delimiter). The `UA2` multiplexed `;TOKEN;`
-  parser corrupts a `UA1` stream.
+- The parser runs in **pure-audio mode** (treat every byte as a sample). NOTE: `UA1` audio is
+  actually lightly *framed* — `US`<span>`;`, samples = pcm + 128, a `;` (0x3B) escaped to 0x3C —
+  but the spans are long, so the pure-audio parser only mis-ingests the one-time `UA1;US` prefix
+  as a few noise samples → harmless for FT8. (Corrected understanding: see `TRUSDX_FACTS.md` §1;
+  the old "UA1 = raw / UA2 = multiplexed-framed" note was **wrong**.) Don't run the `UA2`
+  `;TOKEN;` parser on a `UA1` stream.
 - Single USB cable only: truSDX is self-powered; the Cardputer hosts it on battery. **No
   PORTA 5 V** (PORTA 5 V is only for the bus-powered KH1 USB-C audio adapter).
 - truSDX OLED is a normal **dual-color** panel (yellow top stripe, blue bottom). Its built-in

@@ -1,6 +1,6 @@
 # truSDX RX Support for Mini-FT8 — Status & Handoff
 
-**Last updated:** 2026-05-31
+**Last updated:** 2026-06-04  (RX decode first confirmed 2026-05-31)
 **Branch:** `trusdx-rx` (worktree: `C:\Data\Repos\.worktrees\Mini-FT8\trusdx-rx`)
 **Fork:** `origin` = github.com/jeremywho/Mini-FT8  ·  `upstream` = wcheng95/Mini-FT8
 
@@ -14,6 +14,47 @@ Mini-FT8 on the M5 Cardputer ADV **decodes FT8 received from the (tr)uSDX over a
 USB-C cable.** First on-air decode achieved 2026-05-31. The full chain works on the
 Cardputer: truSDX → USB host → CAT-stream parse → resample 7825→6000 Hz → FT8 monitor →
 decode + waterfall.
+
+---
+
+## Update 2026-06-04 — driver migration · UI cleanup · decode-rate mystery SOLVED
+
+**Sparse decodes = RF CONDITIONS, not a firmware bug — PROVEN.** The "≤1 decode per 15 s slot"
+was chased to the ground: UTC-aligned slots captured off the truSDX on the PC
+(`C:\Users\jerem\trusdx_capture.py`) and decoded with the gold-standard **Ft8DotNet** reference
+(`C:\Data\Repos\ft8-may-2026`) got **0 real decodes** too (2 garbage CRC false-positives),
+seeing the *same* weak Costas candidates (top sync score ~11) the Cardputer sees. A WSJT-X-parity
+decoder pulling nothing off the same antenna ⇒ no decodable signal in the air (indoors / dead
+band). The Cardputer decoder is **fine** — it performs comparably to the reference. Ruled out
+(none changed the count): capture-window clipping, sample rate (measured 7814 ≈ assumed 7825),
+per-block AGC, waterfall scaling, GPS/timing. For decodes you need: real antenna + open band +
+correct frequency (14.074 etc.).
+
+**USB-serial driver MIGRATED to the maintained Espressif stack** (`cdc_acm_host` +
+`ch34x_vcp_open`; see `TRUSDX_FACTS.md` §2–3). The hand-rolled `ch340_usb_serial` USB-host state
+machine was the root of the open / reconnect / stream-death failures. The rewrite backs the
+*same* `Ch340UsbSerial` interface, so `audio_trusdx_serial.cpp` (CAT sequence, `UA1;` retry,
+resample → decode) is unchanged; RX now arrives via a data callback into an SPSC ring.
+
+**STATUS-screen diagnostics REMOVED** — Band/Tune lines are back to normal (the bring-up
+`truSDX 7825->6000` / `RX r/a/o` overlay is gone). **S→3** now retunes the truSDX immediately via
+`sync_radio_to_current_band()` (end-TX + ready guard); **S→2** is a dead-pipe-aware re-sync — a
+2nd press on a *flowing* stream re-pushes the VFO instead of killing the connection, while a dead
+`UA1` pipe still falls through to the recovering teardown. Non-standard per-block **AGC dropped**.
+
+**Robustness issues found, DEFERRED** (NOT decode-count related): the ~1.66 s synchronous decode
+blocks the audio task → the 8 KB CH340 RX ring overflows (~13 KB/slot dropped — a harmless
+dead-zone); free internal heap ~8 KB (NimBLE + USB-host + 80 KB static waterfall; the StampS3 has
+no PSRAM). A `droppedRxBytes()` counter was added. Fix later = decouple decode from capture + claw
+back DRAM; memory-risky on ~8 KB free, so deferred per Codex review.
+
+**Commits (atop `a856669`):** `e250f06` migration · `da36a3d` S-menu fixes · `44d7600` AGC removal.
+Builds clean (`-Werror` + DRAM-budget gate), flashed, on-device smoke test passed (clean S-menu,
+S→3 retunes).
+
+---
+
+## Original bring-up record (2026-05-31)
 
 ### The path that got us here
 1. **PC validation first** — `Decode-Trusdx.ps1` proved the rig streams (`UA1;`) and decodes
@@ -46,13 +87,12 @@ decode + waterfall.
   `gps.cpp`; `-DGPS_ON_PORTA` for a PortA unit). Gets a fix → sets UTC automatically → decodes
   with no manual clock entry. Press `G` for the GPS screen. Coexists with the truSDX.
 
-### On-screen diagnostics (currently in the STATUS screen — temporary)
-While streaming, the STATUS screen (`S`) shows live instrumentation in place of the normal
-Band/Tune lines:
-- **`truSDX 7825->6000`** — resampler in→out rates (`audio_source_get_debug_line1`).
-- **`RX r<raw> a<audio> o<out>`** — bytes received / bytes reaching the resampler / samples out,
-  per second (`audio_source_get_debug_line2`). Healthy: `r`≈`a`≈7800, `o`≈6000 (the `o` digits
-  may be clipped at the right screen edge — it really is ~6000).
+### On-screen diagnostics (REMOVED 2026-06-04 — see "Update 2026-06-04" above)
+The bring-up overlay that replaced the STATUS Band/Tune lines while streaming
+(`truSDX 7825->6000` resampler rates + `RX r<raw> a<audio> o<out>` counter, from
+`audio_source_get_debug_line1/2`) has been removed — STATUS shows normal Band/Tune again. The
+`audio_source_get_debug_line1/2` + `droppedRxBytes()` getters still exist (uncalled by the UI)
+for ad-hoc stream-health checks.
 
 ---
 
@@ -65,10 +105,11 @@ Band/Tune lines:
   `ui_set_rx_list_static`), so a decode shows for one slot then clears if the next slot decodes
   nothing. With GPS time + a decent antenna this is far less noticeable. Optional polish: make
   the list *accumulate* across slots (WSJT-X style).
-- **Diagnostic display still active (intentional, gated):** while the truSDX streams, the STATUS
-  Band/Tune lines show the rate + `RX r/a/o` counter. Gated on `TRUSDX && streaming`, so QMX/KH1
-  are unaffected. Kept as a stream-health indicator while the flaky-connect issue is open;
-  restore Band/Tune later if you want a clean production UI.
+- **Decode rate is conditions-limited, not a bug** (see Update 2026-06-04): a WSJT-X-parity PC
+  decoder pulls 0 real decodes off the same indoor antenna. Needs a real antenna feed + open band.
+- **Robustness (deferred):** the synchronous decode blocks the audio task ~1.66 s/slot → the 8 KB
+  RX ring overflows (~13 KB/slot dropped, harmless dead-zone); free heap ~8 KB. Decouple decode
+  from capture + claw back DRAM later (memory-risky on ~8 KB free now).
 - **TX is not done** — this branch focused on RX. TX synth exists (`ft8_tx_synth`,
   `trusdx_serial_begin_ft8_tx`) but is unverified on-air.
 
@@ -81,10 +122,13 @@ Band/Tune lines:
 | `main/audio_trusdx_serial.cpp` | connect sends `UA1;` (not `UA2;`); removed `RX;` from connect; pure-audio parse via `TrusdxParser.pure_audio` (was a cross-core volatile global); counter line `r/a/o` |
 | `main/radio_trusdx.cpp` | `sync_frequency_mode` skips `RX;` while streaming (RX; suppresses the UA1 stream) |
 | `main/gps.cpp` | GPS UART on **G13/G15** for the M5 LoRa+GPS Cap (default); `-DGPS_ON_PORTA` for a Grove PortA unit |
-| `main/main.cpp` | STATUS diagnostic gated on `TRUSDX && streaming`; STATUS-exit re-sync only when the band changed (clock edits no longer poke the rig) |
+| `main/main.cpp` | S→3 retunes the truSDX immediately (`sync_radio_to_current_band`); S→2 dead-pipe-aware re-sync; STATUS bring-up diagnostics **removed** (Band/Tune restored); STATUS-exit re-sync only when the band changed |
+| `components/ch340_usb_serial/` | **rewritten** to wrap the maintained `cdc_acm_host` + `ch34x_vcp_open` C API (was a hand-rolled USB-host state machine); `+ droppedRxBytes()` counter |
+| `main/ft8_audio_pipeline.cpp` | removed non-standard per-block AGC (it distorted the monitor's overlapping FFT frames) |
+| `main/audio_source.{cpp,h}`, `main/audio_trusdx_serial.{cpp,h}` | `droppedRxBytes()` plumbing for the RX ring |
 | `.gitignore` | ignore `main/wifi_debug.*` (abandoned, kept on disk) and `build_*.log` |
 
-Commits: `65cb66a` (working RX decode), `186a019` (GPS time + review fixes + stop mid-stream re-tune).
+Commits: `65cb66a` (working RX decode), `186a019` (GPS time + review fixes + stop mid-stream re-tune), `e250f06` (cdc_acm/ch34x migration), `da36a3d` (S-menu fixes + diagnostics removed), `44d7600` (AGC removal).
 
 ---
 
