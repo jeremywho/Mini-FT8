@@ -75,6 +75,22 @@ void audio_source_stop(void) {
     s_have_active_backend = false;
 }
 
+uint32_t audio_source_total_rx_bytes(void) {
+    audio_source_backend_t backend = s_have_active_backend ? s_active_backend : s_backend;
+    if (backend == AUDIO_SOURCE_TRUSDX_SERIAL) {
+        return trusdx_serial_total_rx_bytes();
+    }
+    return 0;
+}
+
+uint32_t audio_source_dropped_rx_bytes(void) {
+    audio_source_backend_t backend = s_have_active_backend ? s_active_backend : s_backend;
+    if (backend == AUDIO_SOURCE_TRUSDX_SERIAL) {
+        return trusdx_serial_dropped_rx_bytes();
+    }
+    return 0;
+}
+
 bool audio_source_is_streaming(void) {
     audio_source_backend_t backend = s_have_active_backend ? s_active_backend : s_backend;
     if (backend_is_uac(backend)) {

@@ -22,6 +22,10 @@ bool audio_source_start(void);
 void audio_source_stop(void);
 
 bool audio_source_is_streaming(void);
+// Cumulative bytes received from the active radio link (liveness check). Meaningful
+// for the truSDX serial backend; returns 0 for backends without such a counter.
+uint32_t audio_source_total_rx_bytes(void);
+uint32_t audio_source_dropped_rx_bytes(void);  // cumulative RX bytes dropped (ring full)
 bool audio_source_qmx_detected(void);
 const char* audio_source_get_status_string(void);
 const char* audio_source_get_debug_line1(void);

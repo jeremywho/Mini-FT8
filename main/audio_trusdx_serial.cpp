@@ -27,8 +27,33 @@ static const char* TAG_TX = "TRUSDX_TX";
 static const char* TAG_TUNE = "TRUSDX_TUNE";
 
 static constexpr int TRUSDX_RX_OUTPUT_RATE = FT8_SAMPLE_RATE;
-static constexpr int TRUSDX_CONNECT_TIMEOUT_MS = 10000;
 static constexpr int TRUSDX_CAT_TIMEOUT_MS = 1000;
+// The CH340 init sequence ends by asserting DTR, which is wired to the truSDX
+// ATmega RESET — so enumerating the link REBOOTS the rig. wait_until_ready()
+// only confirms USB enumeration, not that the rig has finished booting. Without
+// a settle delay the connect races ahead and sends CAT / UA1; into a rig that is
+// still rebooting, which is the "first connect dead (~6 B/s), works on retry" bug.
+// The PC reference script waits 4 s after open for exactly this reason.
+static constexpr int TRUSDX_RIG_REBOOT_MS = 4000;
+// First CAT query (ID;) can still land before the rig's parser is alive; retry a
+// few times so a slightly-slow boot self-heals instead of needing a manual reconnect.
+static constexpr int TRUSDX_ID_RETRIES = 5;
+// ESP-IDF's USB host does not reliably enumerate a device that is already attached
+// when the host is installed (it expects hot-plug AFTER install; see esp-idf issues
+// #12412 / #17918 — the timing Kconfig knobs do NOT fix it). Espressif's recommended
+// remedy is app-level retry: fully uninstall + reinstall the host to re-run
+// enumeration. So if the link doesn't come ready, tear the host all the way down
+// and bring it back up, a few times, before giving up. This makes boot-with-cable
+// recover by itself instead of needing a Cardputer power-cycle.
+static constexpr int TRUSDX_ENUM_ATTEMPTS = 4;
+static constexpr int TRUSDX_ENUM_ATTEMPT_MS = 2500;  // per-attempt ready wait
+// The truSDX sometimes accepts UA1; (every CAT query OK) but never starts the RX audio
+// stream: totalRxBytes stays at the CAT byte count, so the audio-fed waterfall is blank
+// while the UI reads "Sync to truSDX" (a dead pipe). Detect that (bytes still low after
+// the reader task starts) and re-issue MD2;/UA1; until audio actually flows.
+static constexpr uint32_t TRUSDX_FLOWING_MIN = 200;       // > this many bytes => RX audio flowing
+static constexpr int      TRUSDX_UA1_RETRIES = 3;         // re-send MD2;/UA1; up to N times
+static constexpr int      TRUSDX_UA1_RETRY_WAIT_MS = 900; // settle window after each re-send
 static constexpr int TRUSDX_TX_CHUNK_BYTES = 64;
 static constexpr int TRUSDX_TX_LEAD_SAMPLES = 128;
 static constexpr int TRUSDX_TX_MARKER_TIMEOUT_MS = 5000;
@@ -480,8 +505,14 @@ static int trusdx_read_ft8_samples(void* ctx, float* out, int max_samples)
                  (unsigned long)parser->raw_since_log,
                  (unsigned long)parser->audio_since_log,
                  (unsigned long)parser->out_since_log);
+        // Line 1: CH340 driver diagnostics so a stuck connect is visible on-screen.
+        // st=DriverState (5=Ready), bi=last bulk-IN status (0=COMPLETED),
+        // tot=cumulative bytes the USB driver has received since begin().
         std::snprintf(s_debug_line1, sizeof(s_debug_line1),
-                      "truSDX %d->%d", TRUSDX_RX_SAMPLE_RATE, TRUSDX_RX_OUTPUT_RATE);
+                      "st%d bi%d tot%lu",
+                      s_ch340.driverState(),
+                      s_ch340.bulkInStatus(),
+                      (unsigned long)s_ch340.totalRxBytes());
         std::snprintf(s_debug_line2, sizeof(s_debug_line2),
                       "r%lu a%lu o%lu",
                       (unsigned long)parser->raw_since_log,
@@ -533,10 +564,10 @@ static void stream_task(void* arg)
     vTaskDelete(nullptr);
 }
 
-static esp_err_t wait_until_ready(void)
+static esp_err_t wait_until_ready(uint32_t timeout_ms)
 {
     TickType_t start = xTaskGetTickCount();
-    while (!timeout_expired(start, TRUSDX_CONNECT_TIMEOUT_MS)) {
+    while (!timeout_expired(start, timeout_ms)) {
         if (!lock_transport(100)) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
@@ -578,19 +609,36 @@ bool trusdx_serial_start(void)
     ESP_LOGI(TAG, "connect start");
     set_status("Connecting truSDX");
 
-    ESP_LOGI(TAG, "ch340 begin");
-    esp_err_t err = s_ch340.begin(TRUSDX_CAT_BAUD);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "connect failed: ch340 begin %s", esp_err_to_name(err));
-        set_status("truSDX CH340 failed");
-        s_streaming_cat_mode = false;
-        s_ch340.end();
-        return false;
+    // Enumeration with retry. A device already attached when the host installs may
+    // not enumerate on the first try (ESP-IDF limitation). Each attempt fully
+    // reinstalls the host (begin) and waits a short window for the link to come
+    // ready; on timeout we tear the host all the way down (end) and try again,
+    // which re-runs enumeration from scratch. This recovers boot-with-cable.
+    esp_err_t err = ESP_ERR_TIMEOUT;
+    bool ready = false;
+    for (int attempt = 0; attempt < TRUSDX_ENUM_ATTEMPTS && !s_stop_requested; ++attempt) {
+        ESP_LOGI(TAG, "ch340 begin (enum attempt %d/%d)", attempt + 1, TRUSDX_ENUM_ATTEMPTS);
+        if (attempt > 0) set_status("Retrying truSDX");
+        err = s_ch340.begin(TRUSDX_CAT_BAUD);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "ch340 begin err %s", esp_err_to_name(err));
+            s_ch340.end();
+            vTaskDelay(pdMS_TO_TICKS(300));
+            continue;
+        }
+        // KEY MEASUREMENT: poll the stack a moment, then ask what devices it knows
+        // about (independent of NEW_DEV) and whether NEW_DEV actually fired.
+        vTaskDelay(pdMS_TO_TICKS(500));
+        if (wait_until_ready(TRUSDX_ENUM_ATTEMPT_MS) == ESP_OK) {
+            ready = true;
+            break;
+        }
+        ESP_LOGW(TAG, "enum attempt %d timed out; reinstalling host", attempt + 1);
+        s_ch340.end();           // full uninstall -> forces fresh enumeration next begin()
+        vTaskDelay(pdMS_TO_TICKS(300));
     }
-
-    err = wait_until_ready();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "connect failed: ch340 ready timeout");
+    if (!ready) {
+        ESP_LOGE(TAG, "connect failed: ch340 not ready after %d attempts", TRUSDX_ENUM_ATTEMPTS);
         set_status("truSDX not found");
         s_streaming_cat_mode = false;
         s_ch340.end();
@@ -600,9 +648,28 @@ bool trusdx_serial_start(void)
     s_connected = true;
     ESP_LOGI(TAG, "ch340 ready");
 
+    // The CH340 DTR assertion above just reset the rig's ATmega. Give it time to
+    // reboot before any CAT, then send a lone ';' to resync the rig's CAT parser
+    // and drop the boot-time bytes. Mirrors the PC capture script (4 s + ';').
+    ESP_LOGI(TAG, "rig reboot settle %d ms", TRUSDX_RIG_REBOOT_MS);
+    set_status("Waking truSDX");
+    vTaskDelay(pdMS_TO_TICKS(TRUSDX_RIG_REBOOT_MS));
+    if (s_stop_requested) { s_connected = false; s_ch340.end(); return false; }
+    trusdx_serial_send_cat(";", TRUSDX_CAT_TIMEOUT_MS);
+    vTaskDelay(pdMS_TO_TICKS(250));
+    { uint8_t drain; while (transport_read_one(&drain)) { /* flush boot/resync bytes */ } }
+    set_status("Connecting truSDX");
+
     char rsp[96] = {};
-    ESP_LOGI(TAG, "send ID;");
-    err = send_cat_wait_response("ID;", rsp, sizeof(rsp), TRUSDX_CAT_TIMEOUT_MS);
+    // ID; is the first real query — retry it so a slightly-slow boot self-heals
+    // instead of dropping the whole connect (the old behavior needed a manual reconnect).
+    err = ESP_ERR_TIMEOUT;
+    for (int attempt = 0; attempt < TRUSDX_ID_RETRIES && !s_stop_requested; ++attempt) {
+        ESP_LOGI(TAG, "send ID; (attempt %d/%d)", attempt + 1, TRUSDX_ID_RETRIES);
+        err = send_cat_wait_response("ID;", rsp, sizeof(rsp), TRUSDX_CAT_TIMEOUT_MS);
+        if (err == ESP_OK && rsp[0] != '\0') break;
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "connect failed: ID %s", esp_err_to_name(err));
         set_status("truSDX ID failed");
@@ -693,6 +760,26 @@ bool trusdx_serial_start(void)
     }
 
     s_started = true;
+    // Give the stream task a moment to pull bytes, then snapshot whether audio is
+    // actually flowing — this distinguishes "connected + streaming" from
+    // "connected but dead pipe" (the st5 tot-frozen case) in the persisted log.
+    vTaskDelay(pdMS_TO_TICKS(800));
+
+    // Dead-pipe recovery: the rig opened and answered all CAT, but UA1; sometimes
+    // doesn't start audio (tot frozen near the CAT byte count -> blank waterfall). The
+    // stream reader task is already running, so re-issuing MD2;/UA1; makes totalRxBytes
+    // climb the moment the rig starts streaming. Stop as soon as audio flows; if it
+    // never does we still return connected (caller/UI unchanged) so the user can retry.
+    for (int r = 0; r < TRUSDX_UA1_RETRIES
+                    && s_ch340.totalRxBytes() <= TRUSDX_FLOWING_MIN
+                    && !s_stop_requested; ++r) {
+        ESP_LOGW(TAG, "no RX audio (tot=%lu); re-sending MD2;/UA1; (retry %d/%d)",
+                 (unsigned long)s_ch340.totalRxBytes(), r + 1, TRUSDX_UA1_RETRIES);
+        set_status("Starting audio");
+        trusdx_serial_send_cat("MD2;", TRUSDX_CAT_TIMEOUT_MS);
+        trusdx_serial_send_cat("UA1;", TRUSDX_CAT_TIMEOUT_MS);
+        vTaskDelay(pdMS_TO_TICKS(TRUSDX_UA1_RETRY_WAIT_MS));
+    }
     return true;
 }
 
@@ -730,6 +817,16 @@ void trusdx_serial_stop(void)
 bool trusdx_serial_is_streaming(void)
 {
     return s_streaming;
+}
+
+uint32_t trusdx_serial_total_rx_bytes(void)
+{
+    return s_ch340.totalRxBytes();
+}
+
+uint32_t trusdx_serial_dropped_rx_bytes(void)
+{
+    return s_ch340.droppedRxBytes();
 }
 
 bool trusdx_serial_is_ready(void)

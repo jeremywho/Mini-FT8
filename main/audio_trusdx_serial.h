@@ -16,6 +16,8 @@ extern "C" {
 bool trusdx_serial_start(void);
 void trusdx_serial_stop(void);
 bool trusdx_serial_is_streaming(void);
+uint32_t trusdx_serial_total_rx_bytes(void);  // cumulative USB bytes received (liveness check)
+uint32_t trusdx_serial_dropped_rx_bytes(void);  // cumulative RX bytes dropped (ring full)
 bool trusdx_serial_is_ready(void);
 bool trusdx_serial_streaming_mode_active(void);
 
