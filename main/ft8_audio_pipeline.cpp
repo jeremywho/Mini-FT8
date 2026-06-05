@@ -157,18 +157,9 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
             ft8_buffer[ft8_buffer_idx++] = temp_dec[i];
 
             if (ft8_buffer_idx >= mon.block_size) {
-                double acc = 0.0;
-                for (int j = 0; j < mon.block_size; ++j) {
-                    acc += fabsf(ft8_buffer[j]);
-                }
-                float level = (float)(acc / mon.block_size);
-                float gain = (level > 1e-6f) ? 0.1f / level : 1.0f;
-                if (gain < 0.1f) gain = 0.1f;
-                if (gain > 10.0f) gain = 10.0f;
-                for (int j = 0; j < mon.block_size; ++j) {
-                    ft8_buffer[j] *= gain;
-                }
-
+                // No per-block AGC: feed the raw resampled audio straight to the monitor.
+                // A per-160ms-block gain step would distort the monitor's overlapping FFT
+                // frames; monitor_process() already log-scales magnitude into the waterfall.
                 if (mon.wf.num_blocks < target_blocks) {
                     monitor_process(&mon, ft8_buffer);
                     push_waterfall_latest(mon);
