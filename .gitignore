@@ -33,3 +33,6 @@ __pycache__/
 main/wifi_debug_creds.h
 main/wifi_debug.cpp
 main/wifi_debug.h
+
+# extra build dir (BLE-off variant)
+/build_bleoff/

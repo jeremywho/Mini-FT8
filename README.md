@@ -201,3 +201,12 @@ Both 9600 and 115200 baud GPS modules are supported (auto-detected). **Make sure
 
 - Mini-FT8 automatically sets KH1 TX power to 2 W.
 - For best RX performance, reduce AF volume to `05` or `06`.
+
+## Known Issues
+
+- **truSDX wattmeter lingers on screen after a CAT transmission (cosmetic).** After Mini-FT8
+  keys the truSDX and returns to RX, the rig is correctly receiving (S-meter live, waterfall
+  resumes) but its display keeps showing the last TX wattmeter instead of your callsign until
+  you tap the physical PTT. This is a truSDX **firmware** limitation, not fixable from the
+  Cardputer. Full investigation, root cause, and path forward (newer truSDX beta firmware or a
+  DL2MAN forum report): see **`TRUSDX_DISPLAY_ISSUE.md`**.

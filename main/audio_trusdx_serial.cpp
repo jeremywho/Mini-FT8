@@ -925,7 +925,7 @@ static inline uint8_t sanitize_trusdx_tx_byte(uint8_t b)
 static void tx_task(void* arg)
 {
     (void)arg;
-    ESP_LOGI(TAG_TX, "TX sequence: TX0; -> ;US -> audio -> RX;");
+    ESP_LOGI(TAG_TX, "TX sequence: UA1;TX0; -> audio -> RX; x3");
     if (!lock_write(1000)) {
         ESP_LOGW(TAG_TX, "write lock timeout");
         s_tx_failed = true;
@@ -935,9 +935,11 @@ static void tx_task(void* arg)
         return;
     }
 
-    // truSDX/uSDX uses TX0; as TX-on. RX; is the TX-off/return-to-RX command.
-    ESP_LOGI(TAG_TX, "send ;TX0;");
-    esp_err_t err = send_cat_locked("TX0;", 500);
+    // truSDX/uSDX uses TX0; as TX-on, RX; as TX-off. Mirror the proven SQ3SWF
+    // recipe: re-assert UA1; with TX0; ("...;UA1;TX0;") so the rig is unambiguously
+    // in unsigned-8-bit-audio streaming mode before we key up.
+    ESP_LOGI(TAG_TX, "send ;UA1;TX0;");
+    esp_err_t err = send_cat_locked("UA1;TX0;", 500);
     if (err != ESP_OK) {
         ESP_LOGW(TAG_TX, "TX0 failed: %s", esp_err_to_name(err));
         unlock_write();
@@ -948,21 +950,14 @@ static void tx_task(void* arg)
         return;
     }
 
-    ESP_LOGI(TAG_TX, "send ;US");
-    err = send_cat_locked(";US", 500);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG_TX, ";US failed: %s", esp_err_to_name(err));
-        esp_err_t rx_err = send_cat_locked("RX;", 300);
-        if (rx_err != ESP_OK) {
-            ESP_LOGW(TAG_TX, "recovery ;RX; failed: %s", esp_err_to_name(rx_err));
-        }
-        unlock_write();
-        s_tx_failed = true;
-        s_tx_active = false;
-        s_tx_task_handle = nullptr;
-        vTaskDelete(nullptr);
-        return;
-    }
+    // Do NOT send a ';US' marker before TX audio. 'US' is the rig->host marker the
+    // rig EMITS to announce ITS RX audio stream (see process_token/parser); it is not
+    // a host->rig command. Sending ';US' then audio leaves the rig parsing an
+    // unterminated CAT token (audio escapes ';', so no delimiter ever arrives) and
+    // reliably crashes the ATmega. Controlled PC test (same audio, framing the only
+    // variable): with ';US' 0/2 survive; without it 3/3 clean; crash is
+    // rate-independent across 11000-11542 B/s, so it is NOT a pacing overrun. SQ3SWF
+    // streams raw audio straight after UA1;TX0; with no marker. Key up, then stream.
 
     ESP_LOGI(TAG_TX, "stream start rate=%d", TRUSDX_TX_SAMPLE_RATE);
     set_status("truSDX TX");
@@ -1031,8 +1026,18 @@ static void tx_task(void* arg)
         ESP_LOGI(TAG_TX, "stream complete");
     }
 
-    ESP_LOGI(TAG_TX, "send ;RX;");
-    esp_err_t rx_err = send_cat_locked("RX;", 500);
+    // Key off: settle ~100ms to let the bulk-OUT drain, then ;RX; x3, mirroring the
+    // proven SQ3SWF recipe (time.sleep(0.1) then ;RX; x3). NOTE: the "single RX; is
+    // lost over cdc_acm" theory was WRONG - the stuck/crashed TX was the ';US' marker
+    // above (now removed), reproduced identically on pyserial. x3 is harmless
+    // insurance and matches the reference.
+    ESP_LOGI(TAG_TX, "send ;RX; x3 (drain + robust key-off)");
+    vTaskDelay(pdMS_TO_TICKS(100));        // let the bulk-OUT / CH340 buffer drain
+    esp_err_t rx_err = ESP_FAIL;
+    for (int i = 0; i < 3; ++i) {
+        rx_err = send_cat_locked("RX;", 500);   // format_cat frames each as ;RX;
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
     if (rx_err != ESP_OK) {
         ESP_LOGW(TAG_TX, ";RX; failed: %s", esp_err_to_name(rx_err));
         ESP_LOGW(TAG_TX, "stuck TX recovery needed");

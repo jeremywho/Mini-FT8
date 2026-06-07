@@ -192,3 +192,15 @@ sparse/zero decodes indoors are conditions, not a firmware fault (confirmed 2026
   UDP broadcast didn't cross the PC's Ethernet↔WiFi boundary, and the build crash-looped on
   boot (RAM). For on-device visibility prefer **on-screen counters** (already wired into the
   STATUS screen), not WiFi.
+
+## Known issues
+
+- **truSDX display: TX wattmeter lingers after a CAT transmission (cosmetic, rig-firmware
+  limitation).** After we key the truSDX over CAT (`UA1;TX0;`→audio→`RX;`) and return to RX, the
+  rig is correctly receiving but its OLED keeps showing the last TX wattmeter instead of the
+  callsign until a **physical PTT** tap. Root-caused 2026-06-07: the uSDX RX-restore
+  `show_banner()` is only reached via the physical-PTT/menu/boot path; the CAT-streaming-TX exit
+  bypasses it. No host fix — `CAT_EXT` (`UK`/`UD`) is not compiled (`UD;`→`?;`), and an RTS
+  hardware-PTT pulse keys the rig but doesn't repaint. Needs a truSDX firmware change. Full
+  record + 7 tested mechanisms + path forward: **`TRUSDX_DISPLAY_ISSUE.md`**. Don't re-investigate
+  from the host.
