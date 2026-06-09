@@ -2684,17 +2684,33 @@ static void gps_runtime_tick() {
   static bool s_time_synced_once = false;
   static bool s_gps_grid_logged = false;
   static int s_last_time_sync_hour_key = -1;
+  // B1: GPS-triggered flash writes must NOT run while audio is streaming — a SPIFFS write
+  // stalls the USB-host task and kills the stream (the "GPS lock drops the truSDX" bug).
+  // Defer them here and flush once audio is idle (see the flush block below).
+  static bool s_save_pending = false;
+  static bool s_grid_log_pending = false;
 
   if (is_kh1_radio(g_radio) && g_kh1_connected) return;
 
   gps_tick();
+
+  // B1: flush any GPS persists deferred while streaming — safe now that audio is idle.
+  if (!audio_source_is_streaming()) {
+    if (s_save_pending) { save_station_data(); s_save_pending = false; }
+    if (s_grid_log_pending && g_grid_gps_display8.size() == 8 &&
+        log_gps_grid_line(g_grid_gps_display8)) {
+      s_gps_grid_logged = true;
+      s_grid_log_pending = false;
+    }
+  }
 
   int detected_baud = 0;
   if (gps_take_baud_update(&detected_baud)) {
     detected_baud = normalize_gps_baud_value(detected_baud);
     if (detected_baud != g_gps_baud) {
       g_gps_baud = detected_baud;
-      save_station_data();
+      if (audio_source_is_streaming()) s_save_pending = true;
+      else save_station_data();
       ESP_LOGI(TAG, "GPS baud persisted: %d", g_gps_baud);
     }
   }
@@ -2771,11 +2787,13 @@ static void gps_runtime_tick() {
       g_time_synced_from_gps &&
       g_grid_from_gps &&
       g_grid_gps_display8.size() == 8) {
-    s_gps_grid_logged = log_gps_grid_line(g_grid_gps_display8);
+    if (audio_source_is_streaming()) s_grid_log_pending = true;
+    else s_gps_grid_logged = log_gps_grid_line(g_grid_gps_display8);
   }
 
   if (changed) {
-    save_station_data();
+    if (audio_source_is_streaming()) s_save_pending = true;
+    else save_station_data();
   }
 }
 

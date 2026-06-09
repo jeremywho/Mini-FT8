@@ -52,4 +52,5 @@ A → B1 → B2 → C1 → C2 → D1 → E1.
 deep fix.)
 
 ## Progress log
-- 2026-06-09: plan created; A1 done (trusdx-rx reset clean off main @3d2a83e).
+- 2026-06-09: plan created; A1 + A2 done (branch reset clean off main @3d2a83e; connect-issue marked likely-resolved).
+- 2026-06-09: **B1 implemented** — `gps_runtime_tick` defers `save_station_data()`/`log_gps_grid_line()` while `audio_source_is_streaming()`, flushes when idle; fast RTC/time sync stays inline. Builds clean. **Pending bench verify** (boot connected to truSDX, confirm GPS lock no longer drops the stream).
