@@ -34,6 +34,28 @@ Sources: [dl2man.de/5-trusdx-details](https://dl2man.de/5-trusdx-details/),
   after open" claim is **not** a documented requirement (refuted), though DTR-on-open does
   reset the ATmega328 on this rig (confirmed hardware behavior).
 
+## 1b. truSDX TX (host→rig)  (HIGH confidence — verified 2026-06-07)
+Sources: [dl2man.de/5-trusdx-details](https://dl2man.de/5-trusdx-details/), on-rig tests + an
+RTL-SDR off-air decode, Codex review. Full record: `TRUSDX_RX_STATUS.md` (2026-06-08 update).
+
+- **TX sequence:** key on `UA1;TX0;`, stream **8-bit unsigned audio @ 11520 Hz**, key off
+  `;RX;`×3. Escape `0x3B` (`;`) in the audio (the rig treats a stray `;` mid-audio as a CAT
+  delimiter). Same key-on/off the proven SQ3SWF `trusdx-audio.py` uses.
+- ⚠️ **DO NOT send `;US` before the TX audio.** `US` is the **rig→host** marker the rig emits
+  to announce ITS RX stream (see §1) — it is NOT a host→rig command. Sending `;US` host→rig
+  leaves the ATmega parsing an unterminated CAT token and **crashes it** (the long-standing
+  "TX sticks/crashes, OLED vertical lines" bug; fixed by removing it). Reproduced on BOTH
+  ESP-IDF cdc_acm and PC pyserial, and **rate-independent** (11000–11542 B/s all crash with
+  `;US`) → not a pacing overrun.
+- **TX sample rate = 11520 Hz** (dl2man.de doc; an off-air decode showed **DT −0.09 s** over a
+  12.6 s frame → the rig clocks it at essentially exactly 11520).
+- **RF-verified:** the firmware's TX frame decodes off-air via RTL-SDR (direct-sampling 20 m)
+  as a valid FT8 message (`CQ K1ABC EL09`, SNR −3.2).
+- **RTS HIGH keys CW/PTT** (dl2man.de) — confirmed: asserting RTS keys the rig (RX stream
+  drops). But RTS-PTT release does NOT repaint the display, and `CAT_EXT` (`UK`/`UD` remote
+  key/display commands) is **not compiled** on this firmware (`UD;`→`?;`), so the post-TX
+  wattmeter-display quirk is not host-fixable. See `TRUSDX_DISPLAY_ISSUE.md`.
+
 ## 2. ESP-IDF v5.4 USB Host (ESP32-S3)  (HIGH confidence)
 Sources: local ESP-IDF docs/source; esp-idf issues
 [#14319](https://github.com/espressif/esp-idf/issues/14319),

@@ -1,6 +1,6 @@
-# truSDX RX Support for Mini-FT8 — Status & Handoff
+# truSDX RX + TX Support for Mini-FT8 — Status & Handoff
 
-**Last updated:** 2026-06-04  (RX decode first confirmed 2026-05-31)
+**Last updated:** 2026-06-08  (RX decode 2026-05-31; TX fixed + RF-verified 2026-06-07)
 **Branch:** `trusdx-rx` (worktree: `C:\Data\Repos\.worktrees\Mini-FT8\trusdx-rx`)
 **Fork:** `origin` = github.com/jeremywho/Mini-FT8  ·  `upstream` = wcheng95/Mini-FT8
 
@@ -14,6 +14,33 @@ Mini-FT8 on the M5 Cardputer ADV **decodes FT8 received from the (tr)uSDX over a
 USB-C cable.** First on-air decode achieved 2026-05-31. The full chain works on the
 Cardputer: truSDX → USB host → CAT-stream parse → resample 7825→6000 Hz → FT8 monitor →
 decode + waterfall.
+
+---
+
+## Update 2026-06-08 — TX WORKING ✅ (root-caused, fixed, RF-verified)
+
+The truSDX **TX** path now works end to end (the branch is no longer RX-only).
+
+**Root cause** of the long-standing "TX sticks / crashes the rig (OLED vertical lines)": the
+firmware sent **`;US` before the TX audio**. `US` is the rig→host marker the rig *emits* to
+announce its RX stream (see §1 of `TRUSDX_FACTS.md`) — it is NOT a host→rig command — so the
+ATmega parsed an unterminated CAT token and crashed. **Fix** (`audio_trusdx_serial.cpp`
+`tx_task`): drop `;US`; key on with `UA1;TX0;` (the proven SQ3SWF sequence); keep `;` escaping
+and `;RX;`×3 key-off. Pacing was ruled out (a byte-rate sweep 11000–11542 B/s crashed
+identically with `;US`, cleanly without it).
+
+**Verified (2026-06-07):** Stage A — the firmware-exact TX audio of a real FT8 frame decodes
+via Ft8DotNet (SNR +17). Stage B — the truSDX, keyed by the fixed sequence into a dummy load,
+transmits a frame an RTL-SDR (direct-sampling 20 m) decodes off-air as `CQ K1ABC EL09`
+(SNR −3.2); DT −0.09 confirms the rig clocks TX audio at exactly 11520 Hz. PC tools: encoder
+`C:\Users\jerem\ft8enc` (text → FT8 tones), proofs `trusdx_tx_proof.py` (A) +
+`trusdx_rf_live_proof.py` (B).
+
+**Still untested:** a real two-way **QSO on a real antenna** (testing used a dummy load).
+Mini-FT8 is a full auto-sequencing FT8 transceiver, so the next step is an on-air contact
+(real 20 m antenna + open band). One cosmetic rig-firmware quirk remains — the TX wattmeter
+lingers on the truSDX OLED after a CAT-controlled TX; see **`TRUSDX_DISPLAY_ISSUE.md`**
+(not host-fixable).
 
 ---
 
@@ -110,8 +137,8 @@ for ad-hoc stream-health checks.
 - **Robustness (deferred):** the synchronous decode blocks the audio task ~1.66 s/slot → the 8 KB
   RX ring overflows (~13 KB/slot dropped, harmless dead-zone); free heap ~8 KB. Decouple decode
   from capture + claw back DRAM later (memory-risky on ~8 KB free now).
-- **TX is not done** — this branch focused on RX. TX synth exists (`ft8_tx_synth`,
-  `trusdx_serial_begin_ft8_tx`) but is unverified on-air.
+- **TX WORKING** — root-caused, fixed, and RF-verified 2026-06-07 (the `;US` marker bug; see the TX update at the top). TX synth (`ft8_tx_synth`,
+  `trusdx_serial_begin_ft8_tx`) drives it. Only a real two-way QSO on a real antenna is still untested.
 
 ---
 

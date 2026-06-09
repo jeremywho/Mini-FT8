@@ -11,7 +11,7 @@ hardware gotchas).
 Make **Mini-FT8** (M5 Cardputer ADV, ESP32-S3) **receive and decode FT8 from a (tr)uSDX**
 QRP radio over a **single USB-C cable**, using PE1NNZ "CAT streaming" — CAT commands and
 8-bit RX audio multiplexed on one USB-CDC serial link @ 115200 baud. **Decode (RX) first**,
-transmit later.
+then TX — both now working (TX root-caused + RF-verified 2026-06-07; see `TRUSDX_RX_STATUS.md` / `TRUSDX_FACTS.md`).
 
 This branch (`trusdx-rx`) = the fork's `design/trusdx-backend` (TX synth + newer base)
 **+ merged `upstream/trusdx` RX**. Fork `origin` = github.com/jeremywho/Mini-FT8,
