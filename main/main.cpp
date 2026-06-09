@@ -3473,6 +3473,21 @@ typedef RxDecodeEntry DecodeMsg;
 static DecodeMsg s_dec[DEC_MAX];
 static int       s_dec_count;
 
+// E1: keep the last non-empty RX list visible for a few empty slots instead of blanking it
+// the instant a slot decodes nothing. s_dec stays the CURRENT slot's decodes (auto-seq/beacon
+// read it directly); only the UI display persists. Cleared after DEC_KEEP_EMPTY_SLOTS empties.
+static constexpr int DEC_KEEP_EMPTY_SLOTS = 2;
+static int s_empty_decode_slots = 0;
+static void publish_rx_list_persist(DecodeMsg* list, int count) {
+  if (count > 0) {
+    s_empty_decode_slots = 0;
+    ui_set_rx_list_static(list, count);
+  } else if (++s_empty_decode_slots > DEC_KEEP_EMPTY_SLOTS) {
+    ui_set_rx_list_static(nullptr, 0);
+  }
+  // else: leave the previously-shown list in place (don't blank on a single empty slot)
+}
+
 // Plain-C field parser: tokenize text into field1/field2/field3.
 // Equivalent to the old fill_fields_from_text lambda but uses no heap.
 static void dec_fill_fields(DecodeMsg* d) {
@@ -3621,7 +3636,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 
   if (num_candidates <= 0) {
     ESP_LOGW(TAG, "No candidates found");
-    ui_set_rx_list_static(nullptr, 0);
+    publish_rx_list_persist(nullptr, 0);  // E1: keep last list for a few empty slots
     if (update_ui) { ui_draw_rx(); }
     else core_fire_rx_changed();  // propagates to all registered consumers (Cardputer, future BLE)
     ble_publish_decode_event(0);
@@ -3818,7 +3833,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   }
 
   // ---- Zero-heap handoff: static s_dec[] → ui.cpp's static rx_lines[] ----
-  ui_set_rx_list_static(s_dec, s_dec_count);
+  publish_rx_list_persist(s_dec, s_dec_count);  // E1: persist across empty slots
 
   if (update_ui) {
     ui_draw_rx();

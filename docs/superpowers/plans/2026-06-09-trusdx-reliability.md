@@ -55,3 +55,4 @@ deep fix.)
 - 2026-06-09: plan created; A1 + A2 done (branch reset clean off main @3d2a83e; connect-issue marked likely-resolved).
 - 2026-06-09: **B1 implemented** — `gps_runtime_tick` defers `save_station_data()`/`log_gps_grid_line()` while `audio_source_is_streaming()`, flushes when idle; fast RTC/time sync stays inline. Builds clean. **Pending bench verify** (boot connected to truSDX, confirm GPS lock no longer drops the stream).
 - 2026-06-09: **B2 implemented** — `TRUSDX_UA1_RETRIES` 3→6 (longer cold-boot dead-pipe self-heal: ~10 s post-open window). Builds clean. **Pending bench verify** (power-cycle truSDX, first `S→2` should reach full ~7800 B/s without a manual reconnect).
+- 2026-06-09: **E1 implemented** — RX list persists the last decodes for `DEC_KEEP_EMPTY_SLOTS` (2) empty slots before clearing (`publish_rx_list_persist`) instead of blanking on the next empty slot; `s_dec` stays current-slot so auto-seq/beacon are unaffected. Builds clean.
