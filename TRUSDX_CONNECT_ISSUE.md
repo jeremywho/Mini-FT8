@@ -1,6 +1,13 @@
 # truSDX Connect Issue — device attached at boot won't enumerate
 
-**Status:** OPEN — but the boot-trace (2026-06-01) **changed the diagnosis**. The real problem
+> **UPDATE 2026-06-09 — LIKELY RESOLVED.** The root cause below (the hand-rolled USB-host
+> driver failing to open/reconnect on a reused host) was eliminated by migrating to the
+> maintained Espressif `cdc_acm_host` + `ch34x_vcp` driver (commit `e250f06`, 2026-06-04),
+> which the spike proved reconnects in place cleanly. Pending a sustained reconnect **soak on
+> the real rig** (reliability plan item C1) to close it definitively. Original investigation
+> kept below for history.
+
+**Status (historical, 2026-06-01):** OPEN — but the boot-trace (2026-06-01) **changed the diagnosis**. The real problem
 is **RECONNECT**, not boot-with-cable: the *first* connect of a boot works (even cable-attached);
 every subsequent connect (after a teardown via `S → 2`) fails. We have peeled back three layers
 with on-device logging — host-reuse fixed, address-adopt fixed — and are now stuck at the device
