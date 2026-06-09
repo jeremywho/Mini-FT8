@@ -52,7 +52,7 @@ static constexpr int TRUSDX_ENUM_ATTEMPT_MS = 2500;  // per-attempt ready wait
 // while the UI reads "Sync to truSDX" (a dead pipe). Detect that (bytes still low after
 // the reader task starts) and re-issue MD2;/UA1; until audio actually flows.
 static constexpr uint32_t TRUSDX_FLOWING_MIN = 200;       // > this many bytes => RX audio flowing
-static constexpr int      TRUSDX_UA1_RETRIES = 3;         // re-send MD2;/UA1; up to N times
+static constexpr int      TRUSDX_UA1_RETRIES = 6;         // B2: re-send MD2;/UA1; up to N times (3->6: cold power-cycle boot can need a longer self-heal window so the FIRST connect doesn't need a manual reconnect)
 static constexpr int      TRUSDX_UA1_RETRY_WAIT_MS = 900; // settle window after each re-send
 static constexpr int TRUSDX_TX_CHUNK_BYTES = 64;
 static constexpr int TRUSDX_TX_LEAD_SAMPLES = 128;
