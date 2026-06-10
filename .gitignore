@@ -36,3 +36,11 @@ main/wifi_debug.h
 
 # extra build dir (BLE-off variant)
 /build_bleoff/
+
+# AI/Claude tooling + local-only working docs (kept on disk, intentionally untracked).
+# Folding anything worth keeping into README / existing upstream docs instead of new files.
+/CLAUDE.md
+/docs/superpowers/
+/TRUSDX_*.md
+.omc/
+.claude/
