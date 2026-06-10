@@ -38,26 +38,3 @@ clean:
 	rm -f $(OBJ) $(TARGET)
 
 .PHONY: all clean
-
-# Phase 1 standalone synth test (no FreeRTOS, no autoseq)
-SYNTH_TARGET = host_synth_test
-SYNTH_SRC = test_ft8_synth.cpp ../main/ft8_tx_synth.cpp
-SYNTH_OBJ = $(SYNTH_SRC:.cpp=.o)
-SYNTH_CXXFLAGS = $(CXXFLAGS) -I../main
-
-$(SYNTH_TARGET): $(SYNTH_OBJ)
-	$(CXX) $(SYNTH_CXXFLAGS) -o $@ $^
-
-# Explicit rule wins over %.o: %.cpp — ensures -I../main is used for this file.
-test_ft8_synth.o: test_ft8_synth.cpp
-	$(CXX) $(SYNTH_CXXFLAGS) -c $< -o $@
-
-../main/ft8_tx_synth.o: ../main/ft8_tx_synth.cpp
-	$(CXX) $(SYNTH_CXXFLAGS) -c $< -o $@
-
-synth: $(SYNTH_TARGET)
-
-clean_synth:
-	rm -f $(SYNTH_OBJ) $(SYNTH_TARGET)
-
-.PHONY: synth clean_synth

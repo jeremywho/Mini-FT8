@@ -44,3 +44,9 @@ main/wifi_debug.h
 /TRUSDX_*.md
 .omc/
 .claude/
+
+# Local-only host synth test + FT8 reference script (kept on disk, not in the repo)
+/host_mock/test_ft8_synth.cpp
+/host_mock/test_ft8_synth_fixtures.h
+/host_mock/host_synth_test
+/tools/ft8_synth_reference.py

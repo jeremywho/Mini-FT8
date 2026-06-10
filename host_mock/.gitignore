@@ -1,7 +1,4 @@
 .cache
 *.o
-*.exe
 host_test
-host_synth_test
-probe_*
 

@@ -18,8 +18,8 @@ dependencies:
   # USB Host UAC for audio streaming
   espressif/usb_host_uac: ^1.2.0
   espressif/usb: '*'
-  # USB Host CDC for CAT
-  espressif/usb_host_cdc_acm: ^2.2.0
+  # USB Host CDC for CAT (pinned ==2.2.0 to match upstream's vendored copy; ch34x_vcp needs only ^2.1.0)
+  espressif/usb_host_cdc_acm: '==2.2.0'
   # Maintained CH34x Virtual COM Port driver (used by ch340_usb_serial)
   espressif/usb_host_ch34x_vcp: ^2
   # TinyUSB device stack for MSC log export.
