@@ -12,21 +12,21 @@ add specific files when committing, not `-A`.
 ## Items
 
 ### A — Housekeeping
-- [ ] **A1.** Drop the WIP diagnostics/IDF-drift commit; start clean off `main`.
-- [ ] **A2.** Refresh stale `TRUSDX_CONNECT_ISSUE.md` (reconnect likely fixed by the cdc_acm/ch34x migration; pending soak).
+- [x] **A1.** Drop the WIP diagnostics/IDF-drift commit; start clean off `main`.
+- [x] **A2.** Refresh stale `TRUSDX_CONNECT_ISSUE.md` (reconnect likely fixed by the cdc_acm/ch34x migration; pending soak).
 
 ### B — Reliability fixes (bench-testable now: truSDX + GPS connected)
-- [ ] **B1. GPS-lock stream drop.** `gps_runtime_tick` (`main.cpp:2682`) does SPIFFS writes
+- [x] **B1. GPS-lock stream drop.** `gps_runtime_tick` (`main.cpp:2682`) does SPIFFS writes
   (`save_station_data`, `log_gps_grid_line`) on first GPS lock, **unguarded vs `g_streaming`**
   → the flash write stalls the USB-host task → the truSDX RX stream dies → "connect to truSDX".
   **Fix:** defer the persists (flag + flush when `!g_streaming`, e.g. between slots), keep the
   fast `settimeofday`/RTC sync inline. Repro before/after on the bench. [small/surgical]
-- [ ] **B2. Flaky first connect** (~6 B/s until one reconnect after a truSDX power-cycle).
+- [x] **B2. Flaky first connect** (~6 B/s until one reconnect after a truSDX power-cycle).
   Connect path in `audio_trusdx_serial.cpp` — tune the existing UA1/enum retry: longer settle
   + auto-retry on first connect. [small–medium]
 
 ### C — Verification
-- [ ] **C1. Reconnect soak.** Repeated `S→2` teardown + reconnect, sustained-stream soak; then
+- [x] **C1. Reconnect soak.** Repeated `S→2` teardown + reconnect, sustained-stream soak; then
   close or reopen `TRUSDX_CONNECT_ISSUE.md` based on results. [test-only]
 - [ ] **C2. Real on-air QSO test.** Operational — needs a real 20 m antenna + open band. Use the
   Cardputer auto-seq flow (answer a CQ). [test-only, user-driven]
@@ -39,7 +39,7 @@ add specific files when committing, not `-A`.
   as B1.** [large/risky — design first] → **DESIGNED; deferred to a focused bench session. See "D1 — design assessment" below.**
 
 ### E — Polish
-- [ ] **E1. Decode list accumulates across slots** (WSJT-X style) instead of rebuilding each
+- [x] **E1. Decode list accumulates across slots** (WSJT-X style) instead of rebuilding each
   slot (`main.cpp`: stop resetting `s_dec_count` each slot; accumulate + age out). [small–medium]
 
 ### Not our code
@@ -57,6 +57,8 @@ deep fix.)
 - 2026-06-09: **B2 implemented** — `TRUSDX_UA1_RETRIES` 3→6 (longer cold-boot dead-pipe self-heal: ~10 s post-open window). Builds clean. **Pending bench verify** (power-cycle truSDX, first `S→2` should reach full ~7800 B/s without a manual reconnect).
 - 2026-06-09: **E1 implemented** — RX list persists the last decodes for `DEC_KEEP_EMPTY_SLOTS` (2) empty slots before clearing (`publish_rx_list_persist`) instead of blanking on the next empty slot; `s_dec` stays current-slot so auto-seq/beacon are unaffected. Builds clean.
 - 2026-06-09: **D1 investigated + designed; deferred to bench (NOT implemented).** Traced the full live path and the memory model (code-grounded). Conclusion: every real fix needs DRAM the StampS3 does not have (~8 KB free heap, no PSRAM). A blind refactor would risk regressing the verified B1/B2/E1, and the benefit is unmeasurable on a dead band. Documented the design + the first experiment to run on the bench. See "D1 — design assessment" below.
+- 2026-06-09: **batch FLASHED to Cardputer COM8** (B1+B2+E1; build clean, app partition 78% free, all hashes verified, RTS hard-reset booted).
+- 2026-06-09: **BENCH-VERIFIED B1 + B2 + C1 + E1 on the real rig (user).** GPS lock no longer drops the stream (B1); first connect reaches full rate without a manual reconnect (B2); repeated `S→2` reconnect soak held with no wedge (C1) → `TRUSDX_CONNECT_ISSUE.md` marked **RESOLVED**; decode list no longer blinks out on empty slots (E1). **Only `C2` (on-air QSO, real antenna) remains.** D1 stays designed/deferred.
 
 ## D1 — design assessment (deferred to a focused bench session)
 

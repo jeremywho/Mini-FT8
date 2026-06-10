@@ -1,11 +1,13 @@
 # truSDX Connect Issue — device attached at boot won't enumerate
 
-> **UPDATE 2026-06-09 — LIKELY RESOLVED.** The root cause below (the hand-rolled USB-host
+> **UPDATE 2026-06-09 — RESOLVED.** The root cause below (the hand-rolled USB-host
 > driver failing to open/reconnect on a reused host) was eliminated by migrating to the
 > maintained Espressif `cdc_acm_host` + `ch34x_vcp` driver (commit `e250f06`, 2026-06-04),
-> which the spike proved reconnects in place cleanly. Pending a sustained reconnect **soak on
-> the real rig** (reliability plan item C1) to close it definitively. Original investigation
-> kept below for history.
+> which the spike proved reconnects in place cleanly. **Confirmed on the real rig 2026-06-09**
+> (reliability plan item C1: repeated `S → 2` teardown + reconnect soak held; no wedge, no
+> Cardputer power-cycle needed). The `B1` fix (defer GPS-lock flash writes during streaming,
+> commit `c4eabb2`) also removed the related "stream dies on first GPS lock" stall. Original
+> investigation kept below for history.
 
 **Status (historical, 2026-06-01):** OPEN — but the boot-trace (2026-06-01) **changed the diagnosis**. The real problem
 is **RECONNECT**, not boot-with-cable: the *first* connect of a boot works (even cable-attached);
