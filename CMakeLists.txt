@@ -4,6 +4,26 @@ cmake_minimum_required(VERSION 3.16)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(mini_ft8)
+
+# POST_BUILD DRAM budget check — fails the build if static free DIRAM falls
+# below the per-variant threshold in tools/check_dram_budget.py. Catches silent
+# CDC-ACM allocation failures caused by NimBLE consuming DRAM before runtime.
+# Override the variant with -DDRAM_CHECK_VARIANT=ft4 for the FT4 build.
+# Hooked to TARGET app (post-link) so esp_idf_size sees the final ELF/.map, and
+# ordered before merge_bin so a budget failure aborts before the merged image.
+if(NOT DEFINED DRAM_CHECK_VARIANT)
+    set(DRAM_CHECK_VARIANT "ft8")
+endif()
+add_custom_command(TARGET app POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E echo "[check_dram_budget] Running DRAM budget check (variant=${DRAM_CHECK_VARIANT})..."
+    COMMAND ${PYTHON}
+            ${CMAKE_SOURCE_DIR}/tools/check_dram_budget.py
+            ${CMAKE_BINARY_DIR}
+            --variant ${DRAM_CHECK_VARIANT}
+    COMMENT "Checking DRAM budget"
+    VERBATIM
+)
+
 # Normal idf.py flash preserves the existing storage partition. The merged
 # release image also leaves SPIFFS untouched; first boot after repartition can
 # format SPIFFS if mount fails.
