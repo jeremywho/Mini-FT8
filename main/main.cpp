@@ -67,6 +67,7 @@ extern "C" {
 #include "esp_vfs_fat.h"
 #include "esp_spiffs.h"
 #include "esp_partition.h"
+#include "esp_ota_ops.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "tinyusb_msc.h"
@@ -6425,6 +6426,13 @@ static void unmount_storage() {
   s_storage_mounted = false;
 }
 
+// Bail back to the launcher (factory app). No-op when flashed standalone (no factory).
+static void return_to_launcher() {
+  const esp_partition_t* f = esp_partition_find_first(
+      ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, nullptr);
+  if (f && esp_ota_set_boot_partition(f) == ESP_OK) esp_restart();
+}
+
 static void app_task_core0(void* /*param*/) {
   storage_mutex_init();
   log_mem_caps("STORAGE_MUTEX_INIT");
@@ -6547,10 +6555,14 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     }
   }
 
+  // G0/BOOT button on GPIO0 (not in the keyboard matrix) returns to the launcher.
+  gpio_set_direction(GPIO_NUM_0, GPIO_MODE_INPUT);
+  gpio_set_pull_mode(GPIO_NUM_0, GPIO_PULLUP_ONLY);
   // UI loop
   char last_key = 0;
   while (true) {
     M5Cardputer.update();
+    if (gpio_get_level(GPIO_NUM_0) == 0) return_to_launcher();
     M5Cardputer.Keyboard.updateKeysState();
     auto &state = M5Cardputer.Keyboard.keysState();
     char c = 0;
