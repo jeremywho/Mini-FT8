@@ -32,6 +32,13 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 > real antenna + open band). See `TRUSDX_RX_STATUS.md` (status), `CLAUDE.md` (build/flash/test),
 > and `TRUSDX_FACTS.md` (protocol + USB-host facts).
 
+> **Cardputer-launcher note:** this build also carries a small **G0/BOOT → launcher** hook so
+> FT8 can run alongside WSPR and a GPS/LoRa-chat app in a **cardputer-launcher** OTA suite — a
+> factory-slot menu that boots whichever app you pick (each app sits in its own OTA partition).
+> Inside that suite, pressing **G0** returns to the launcher menu; flashed standalone it does
+> nothing (FT8 is then the factory app, so there is no launcher to return to). It is
+> self-contained in `return_to_launcher()` and only fires when running from an OTA slot.
+
 ## Quick Mode Map
 
 | Key | Mode | Purpose |
