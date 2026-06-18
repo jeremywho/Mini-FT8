@@ -37,11 +37,9 @@ main/wifi_debug.h
 # extra build dir (BLE-off variant)
 /build_bleoff/
 
-# AI/Claude tooling + local-only working docs (kept on disk, intentionally untracked).
-# Folding anything worth keeping into README / existing upstream docs instead of new files.
-/CLAUDE.md
+# AI tooling / scratch dirs — keep local. (CLAUDE.md + TRUSDX_*.md are now TRACKED as the
+# repo's session/dev guide — published 2026-06 so future contexts can hit the ground running.)
 /docs/superpowers/
-/TRUSDX_*.md
 .omc/
 .claude/
 
