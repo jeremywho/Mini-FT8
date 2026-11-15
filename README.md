@@ -29,7 +29,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 > (tr)uSDX over a single USB-C cable — and builds with BLE **on** (`idf.py -DENABLE_BLE=ON build`).
 > Select the radio at **MENU P2 → `3`** (cycles `QMX` → `KH1-USBC` → `KH1-MIC` → `truSDX`). RX
 > works; known caveats are a flaky first connect and conditions-limited decode count (needs a
-> real antenna + open band). See `TRUSDX_RX_STATUS.md` (status), `CLAUDE.md` (build/flash/test),
+> real antenna + open band). See `TRUSDX_RX_STATUS.md` (status), `AGENTS.md` (build/flash/test),
 > and `TRUSDX_FACTS.md` (protocol + USB-host facts).
 
 > **Cardputer-launcher note:** this build also carries a small **G0/BOOT → launcher** hook so

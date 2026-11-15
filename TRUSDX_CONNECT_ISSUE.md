@@ -362,7 +362,7 @@ generates the enumeration event).
 ## Build / flash (for whoever picks this up)
 
 Standard **ESP-IDF** project (`idf.py`, target **esp32s3**), IDF **v5.4.x** at `C:\esp\esp-idf`.
-Full details in `CLAUDE.md`. Quick version (PowerShell, from this worktree):
+Full details in `AGENTS.md`. Quick version (PowerShell, from this worktree):
 ```powershell
 . C:\esp\esp-idf\export.ps1
 idf.py -DENABLE_BLE=ON build

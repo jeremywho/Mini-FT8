@@ -4,7 +4,7 @@
 **Branch:** `trusdx-rx` (worktree: `C:\Data\Repos\.worktrees\Mini-FT8\trusdx-rx`)
 **Fork:** `origin` = github.com/jeremywho/Mini-FT8  ·  `upstream` = wcheng95/Mini-FT8
 
-> See **`CLAUDE.md`** for the durable build / flash / test how-to. This file = current status.
+> See **`AGENTS.md`** for the durable build / flash / test how-to. This file = current status.
 
 ---
 
@@ -159,7 +159,7 @@ Commits: `65cb66a` (working RX decode), `186a019` (GPS time + review fixes + sto
 
 ---
 
-## Hardware facts (full list in CLAUDE.md)
+## Hardware facts (full list in AGENTS.md)
 
 - truSDX firmware **R2.00x beta** (streaming + 115200); stable 2.00i has no streaming (CAT 38400).
 - truSDX = CH340, micro-USB, **data** cable required; DTR wired to MCU RESET.

@@ -1,4 +1,4 @@
-# CLAUDE.md — Mini-FT8 × (tr)uSDX  (`trusdx-rx` branch)
+# AGENTS.md — Mini-FT8 × (tr)uSDX  (`trusdx-rx` branch)
 
 Project-specific guide for working in this repo. Read **`TRUSDX_RX_STATUS.md`** first for
 current status and open problems — this file is the durable how-to (build / flash / test /

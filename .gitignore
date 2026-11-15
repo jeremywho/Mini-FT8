@@ -37,7 +37,7 @@ main/wifi_debug.h
 # extra build dir (BLE-off variant)
 /build_bleoff/
 
-# AI tooling / scratch dirs — keep local. (CLAUDE.md + TRUSDX_*.md are now TRACKED as the
+# AI tooling / scratch dirs — keep local. (AGENTS.md + TRUSDX_*.md are now TRACKED as the
 # repo's session/dev guide — published 2026-06 so future contexts can hit the ground running.)
 /docs/superpowers/
 .omc/
